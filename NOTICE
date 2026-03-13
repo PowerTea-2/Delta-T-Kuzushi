@@ -1,44 +1,44 @@
 MPCP was designed and authored by PowerTea-2, the "Founding Architect."
-=========================================================================
-/////////////////////////////////////////////////////////////////////////
-=========================================================================
+=========================================================================\
+//////////////////////////////////////////////////////////////////////////|
+=========================================================================/
 Preservation of Moral Rights:
 The author hereby asserts their Moral Right to be identified as the 
 creator of this work under the copyright laws of the European Union. 
 This includes the right of integrity: no person may modify this protocol in a way that is prejudicial to the author's honor or reputation.
-=========================================================================
-/////////////////////////////////////////////////////////////////////////
-=========================================================================
+=========================================================================\
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>|>
+=========================================================================/
 Prohibition of Misrepresentation:
 Pursuant to Section 7(c) of the GNU AGPLv3, 
 the origin of this material must not be misrepresented. Any modified version 
 of this software must be marked in a prominent way as being different from the 
 original version and must clearly state that it is a derivative of the "Multi-Port Catch Protocol (MPCP)" authored by PowerTea-2.
-=========================================================================
-/////////////////////////////////////////////////////////////////////////
-=========================================================================
+=========================================================================\
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>|>
+=========================================================================/
 Mandatory Attribution in User Interfaces:
 Pursuant to Section 7(b) of the GNU AGPLv3, 
 any work that conveys or distributes a modified version of MPCP must 
 preserve the "Founding Architect" and "Protocol Specification" credits 
 in all Interactive User Interfaces (including CLI splash screens, --help menus, 
 and --version outputs). These notices must be displayed prominently and in a font/size consistent with other program information.
-=========================================================================
-/////////////////////////////////////////////////////////////////////////
-=========================================================================
+=========================================================================\
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>|>
+=========================================================================/
 Protection of Architectural Integrity:
 Any derivative work that modifies the core Z-score normalization or 
 the timing-window logic (Section 7 and Section 14 of the original Specification) MUST
 be clearly labeled as an "Unverified Implementation." The name "MPCP" may only be used without 
 qualification for implementations that strictly adhere to the PowerTea-2 Protocol Specification v0.5.
-==========================================================================
-//////////////////////////////////////////////////////////////////////////
-==========================================================================
+==========================================================================\
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>|>
+==========================================================================/
 Disclaimer of Endorsement and Liability:
 This protocol is provided for privacy-research and educational purposes. 
 The "Founding Architect" (PowerTea-2) provides the mathematical specification "as-is" without warranty. 
 PowerTea-2 does not endorse, encourage, or facilitate any illegal use of this software. 
 By using this protocol, the user assumes all legal and technical risks.
-=========================================================================
-/////////////////////////////////////////////////////////////////////////
-=========================================================================
+=========================================================================\
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>|>
+=========================================================================/
