@@ -38,6 +38,27 @@ sudo apt install libsodium-dev libzstd-dev
 ```
 
 #### Arch Linux
+
+                                                –
+                                              . O+  `
+                                            ` OOO /
+                                         ` +OOOO :
+                                      ` +OOOOOO :
+                                      - +OOOOOO+ :
+                                  ` / : - : + +OOOO+ :
+                                ` / ++++ / +++++++ :
+                              ` / ++++++++++++++ :
+                            ` / +++OOOOOOOOOOO/ `
+                          . / OOOSSSSO++OSSSSSO+`
+                        . OOSSSSSO - ` ` ` ` /OSSSSSS+ `
+                    -  OSSSSSSO .                : SSSSSSSO .
+                  : OSSSSSSS /                     OSSSSO+++ .
+               / OSSSSSSSS /                     +SSSSOOO/ -  
+         `  / OSSSSSO+ /  : -                     - : / +OSSSSO+ -
+       ` +SSO+ : -  `                                             ` . - / +OSO :
+    ` ++ :  .                                                                      `  - / + /
+    .  `                                                                                      ` /
+
 ```bash
 sudo pacman -S libsodium zstd
 ```
