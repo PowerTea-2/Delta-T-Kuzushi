@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A sophisticated privacy-research protocol designed for multi-port communication and event correlation analysis.
+A sophisticated privacy-research protocol designed for multi-port communication and event correlation analysis. This was made with nothing but love, i deeply care for this project, once its up and running i pray everyone who uses this will love it as much as me and litaliano00-dev do, lots of love, Power. <3
 
 ---
 
