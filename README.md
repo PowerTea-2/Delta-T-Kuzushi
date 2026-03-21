@@ -1,18 +1,25 @@
+md
 <div align="center">
 
-.  * .  . * * .        .        .   * ..
+<br>
+
 # ☾ ⋆⁺₊⋆ MPCP ⋆⁺₊⋆ ☾
 ### 🌌 Multi-Port Catch Protocol 🌌
-.  * .  . * * .        .        .   * ..
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+<sub><em>sealed under moonlight for privacy research and event-correlation analysis</em></sub>
 
-**v0.5** — *A cryptographically sealed, multi-port catch protocol for privacy research and event-correlation analysis.*
+<br>
 
-༺ ═════════════════════ ⋆⋅☆⋅⋆ ═════════════════════ ༻
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-7c8cff.svg?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
 
-**Founding Architect** — PowerTea-2 <br>
-**Protocol Specification** — v0.5
+<br>
+
+༺═⋆═༻
+
+**Founding Architect** · PowerTea-2  
+**Protocol Specification** · v0.5
+
+༺═⋆═༻
 
 </div>
 
@@ -20,15 +27,17 @@
 
 MPCP is a high-assurance UDP protocol engineered for:
 
-✦ **Z-score timing windows** and real-time event correlation  
-✦ **XChaCha20-Poly1305 + HKDF** key material derived from shared nonce + PSK  
-✦ **Dynamic port-hopping** with ghost chunks for traffic blending  
-✦ **Tripwire detection** (z-score + χ² loss-pattern analysis)  
-✦ **Zero-copy pipeline** with `SCHED_FIFO` timing thread  
+- ✦ **Z-score timing windows** and real-time event correlation
+- ✦ **XChaCha20-Poly1305 + HKDF** key material derived from shared nonce + PSK
+- ✦ **Dynamic port-hopping** with ghost chunks for traffic blending
+- ✦ **Tripwire detection** using z-score and χ² loss-pattern analysis
+- ✦ **Zero-copy pipeline** with `SCHED_FIFO` timing thread
 
 > *Built for researchers who need something that simply **does not leak**.*
 
-༺ ════════════════════════ ☾ ★ ☽ ════════════════════════ ༻
+<br>
+
+༺═⋆═༻
 
 ## 🌠 Dependencies & Installation
 
@@ -59,6 +68,7 @@ sudo dnf install libsodium-devel libzstd-devel
 <details>
 <summary><b>🏹 Arch Linux</b></summary>
 
+
 sudo pacman -S libsodium zstd
 
 </details>
@@ -71,48 +81,54 @@ brew install libsodium zstd
 
 </details>
 
-༺ ════════════════════════ ☾ ★ ☽ ════════════════════════ ༻
-⚡ Compilation
+<br>
 
-Once your dependencies are sparkling, compile with:
+༺═⋆═༻
+
+## ⚡ Compilation
+
+Once your dependencies are ready, compile with:
 
 
-gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
-    mpcp_fixed.c -o mpcp -lsodium -lzstd -lm -lpthread
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2
+mpcp_fixed.c -o mpcp -lsodium -lzstd -lm -lpthread
 
-༺ ════════════════════════ ☾ ★ ☽ ════════════════════════ ༻
-📜 Legal & Moral Rights
 
-Licensed under GNU Affero General Public License v3.0.
+<br>
 
-Moral Rights asserted by PowerTea-2 under EU copyright law.
+༺═⋆═༻
+
+## 📜 Legal & Moral Rights
+
+Licensed under the **GNU Affero General Public License v3.0**.
+
+**Moral Rights** asserted by PowerTea-2 under EU copyright law.
 
 Any derivative must:
 
-    Clearly mark itself as a fork
+- Clearly mark itself as a fork
+- Preserve the **“Founding Architect”** credit in all UI elements
+- Label any deviation from the v0.5 spec as **“Unverified Implementation”**
 
-    Preserve the “Founding Architect” credit in all UI elements
+See `NOTICE` and `LICENSE` for full terms.
 
-    Label any deviation from v0.5 spec as “Unverified Implementation”
+<br>
 
-See NOTICE and LICENSE for full terms.
+༺═⋆═༻
 
-༺ ════════════════════════ ☾ ★ ☽ ════════════════════════ ༻
-📖 Documentation & Security
+## 📖 Documentation & Security
 
-    Full Protocol Spec — MPCP_v0.5_FINAL_PowerTea-2.pdf
+- **Full Protocol Spec** — `MPCP_v0.5_FINAL_PowerTea-2.pdf`
+- **Legal Notice** — `NOTICE`
+- **Security & Research Note** — MPCP is provided strictly for privacy research and educational use
+- **Warranty** — none; use at your own risk
 
-    Legal Notice — NOTICE
-
-    🔒 Security & Research Note
-
-    MPCP is provided strictly for privacy research and educational use.
-
-    No warranty. Use at your own risk.
+<br>
 
 <div align="center">
 
-༺ ═════════════════════ ⋆⋅☆⋅⋆ ═════════════════════ ༻
-Created under starlight by PowerTea-2 🌌
+༺═⋆═⋆═⋆═⋆═⋆═⋆═⋆═༻  
+**Created under starlight by PowerTea-2** 🌙  
+༺═⋆═⋆═⋆═⋆═⋆═⋆═⋆═༻
 
 </div>
