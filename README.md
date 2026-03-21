@@ -2,10 +2,10 @@
 
 <br>
 
-# ☾ ⋆⋆ MPCP ⋆⋆ ☽
-### 🌌 Multi-Port Catch Protocol 🌌
+# ☾ AetherSync ☽
+### 🌌 Nightbound synchronization for MPCP 🌌
 
-<sub><em>sealed in silence · shaped for precision · built to not leak</em></sub>
+<sub><em>built under starlight for precision, privacy, and event-correlation research</em></sub>
 
 <br>
 
@@ -13,20 +13,25 @@
 
 <br>
 
-═══════════════════════════════════════  
-▣ ▣ ▣   F O U N D A T I O N   ▣ ▣ ▣  
-═══════════════════════════════════════  
+༺═⋆════════════════════════════⋆═༻  
+   ☾  C O R E   I D E N T I T Y  ☽  
+༺═⋆════════════════════════════⋆═༻  
 
-**Founding Architect** · PowerTea-2  
-**Protocol Specification** · v0.5  
-
-═══════════════════════════════════════  
+**Protocol** · MPCP  
+**Project** · AetherSync  
+**Maintainer** · PowerTea-2  
 
 </div>
 
-## ✨ Overview
+<br>
 
-MPCP is a high-assurance UDP protocol engineered for:
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  O V E R V I E W  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
+
+AetherSync is the tooling and reference implementation built around **MPCP** — the **Multi-Port Catch Protocol**.
+
+It is engineered for:
 
 - ✦ **Z-score timing windows** and real-time event correlation  
 - ✦ **XChaCha20-Poly1305 + HKDF** key derivation from shared nonce + PSK  
@@ -34,13 +39,28 @@ MPCP is a high-assurance UDP protocol engineered for:
 - ✦ **Tripwire detection** using z-score and χ² loss-pattern analysis  
 - ✦ **Zero-copy pipeline** with `SCHED_FIFO` timing thread  
 
-> *Built for researchers who require something that simply **does not leak**.*
+> *For researchers who require something that simply does not leak.*
 
 <br>
 
-═══════════════════════════════════════  
-▣ ▣ ▣   I N S T A L L A T I O N   ▣ ▣ ▣  
-═══════════════════════════════════════  
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  P R O T O C O L  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
+
+**MPCP** is the protocol.
+
+**AetherSync** is the implementation and tooling built around it.
+
+- MPCP defines behavior, timing, and cryptographic structure  
+- AetherSync executes and exposes that system  
+
+This separation ensures the protocol remains independently verifiable.
+
+<br>
+
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  I N S T A L L A T I O N  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
 
 <details>
 <summary><b>✨ Nix (fully reproducible)</b></summary>
@@ -79,36 +99,36 @@ MPCP is a high-assurance UDP protocol engineered for:
 
 <br>
 
-═══════════════════════════════════════  
-▣ ▣ ▣   C O M P I L A T I O N   ▣ ▣ ▣  
-═══════════════════════════════════════  
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  C O M P I L A T I O N  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
 
     gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
-        mpcp_fixed.c -o mpcp -lsodium -lzstd -lm -lpthread
+        aethersync.c -o aethersync -lsodium -lzstd -lm -lpthread
 
 <br>
 
-═══════════════════════════════════════  
-▣ ▣ ▣   L E G A L   ▣ ▣ ▣  
-═══════════════════════════════════════  
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  L E G A L  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
 
 Licensed under the **GNU Affero General Public License v3.0**  
 
-Moral Rights asserted by PowerTea-2 under EU copyright law  
+**Moral Rights** asserted by PowerTea-2 under EU copyright law  
 
 Any derivative must:
 
-- Clearly mark itself as a fork  
-- Preserve the **Founding Architect** credit  
-- Label deviations as **Unverified Implementation**  
+- clearly mark itself as a fork  
+- preserve the **Founding Architect** credit in all UI elements  
+- label deviations from the MPCP spec as **Unverified Implementation**  
 
 See `NOTICE` and `LICENSE` for full terms.
 
 <br>
 
-═══════════════════════════════════════  
-▣ ▣ ▣   D O C U M E N T A T I O N   ▣ ▣ ▣  
-═══════════════════════════════════════  
+༺═══════════════◈═══════════════༻  
+   ⋆₊⁺  D O C U M E N T A T I O N  ⁺₊⋆  
+༺═══════════════◈═══════════════༻  
 
 - **Full Protocol Spec** — `MPCP_v0.5_FINAL_PowerTea-2.pdf`  
 - **Legal Notice** — `NOTICE`  
@@ -119,9 +139,9 @@ See `NOTICE` and `LICENSE` for full terms.
 
 <div align="center">
 
-═══════════════════════════════════════  
-☾ carved under cold starlight ☽  
-**PowerTea-2**  
-═══════════════════════════════════════  
+༺═⋆════════════════════════════⋆═༻  
+        ☾ carved under cold starlight ☽  
+             **PowerTea-2**  
+༺═⋆════════════════════════════⋆═༻  
 
 </div>
