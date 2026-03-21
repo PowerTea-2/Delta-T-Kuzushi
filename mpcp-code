@@ -205,7 +205,7 @@ extern const char *mpcp_strerror(mpcp_err_t err);
   
   /* Transfer */
   uint32_t    pipeline_depth;     /* default 1   */
-  uint32_t    chunk_pad_size;     /* default 131072 */
+  uint32_t    chunk_pad_size;     /* default 63488 (62KB, fits IPv4 UDP max) */
   int         zstd_level;         /* default 3   */
   bool        ghost_chunks_enabled;
   uint32_t    ghost_chunk_min;    /* default 5   */
@@ -254,6 +254,7 @@ extern const char *mpcp_strerror(mpcp_err_t err);
   /* Heap-allocated via sodium_malloc - must sodium_free when done */
   uint8_t *keystream;   /* total_chunks * MPCP_KEYSTREAM_SLOT bytes */
   uint32_t total_chunks;
+  bool     skip_compression; /* received from transfer_info flags; tells receiver not to ZSTD_decompress */
   } mpcp_session_t;
 
 /* -------------------------
@@ -859,7 +860,8 @@ uint32_t                 chunk_idx);
   uint8_t       *ct_out,
   size_t        *ct_len_out,
   uint8_t        nonce_out[24],
-  uint8_t        flags);
+  uint8_t        flags,
+  uint32_t       chunk_pad_size);
 
 /*
 
@@ -1053,6 +1055,10 @@ _Atomic(bool)            *sent_flag;        /* [n_chunks] */
 uint64_t                 *sent_time_ns;     /* [n_chunks] -> send timestamp */
 
 _Atomic(bool)             abort_flag;
+/* Pipeline completion flags — reader sets t1_done, compressor sets t2_done.
+ * Downstream stages wait for these before exiting to avoid dropping buffered work. */
+_Atomic(bool)             t1_done;
+_Atomic(bool)             t2_done;
 mpcp_tripwire_t           tripwire;
 
 } mpcp_sender_ctx_t;
@@ -1095,6 +1101,12 @@ size_t                    decrypt_buf_sz;
 
 _Atomic(uint32_t)         chunks_verified;
 _Atomic(bool)             abort_flag;
+/* Pipeline stage completion flags — set by each stage when it has
+ * finished producing. Downstream stages wait on these before exiting
+ * so no buffered work is lost. abort_flag is for hard errors only. */
+_Atomic(bool)             t1_done;   /* T1 finished receiving */
+_Atomic(bool)             t2_done;   /* T2 finished verifying */
+_Atomic(bool)             t3_done;   /* T3 finished decrypting */
 mpcp_tripwire_t           tripwire;
 
 } mpcp_receiver_ctx_t;
@@ -1788,7 +1800,7 @@ static void mpcp_perror(const char *stage, int rc)
   
   /* Transfer */
   cfg->pipeline_depth     = 1;
-  cfg->chunk_pad_size     = 131072;
+  cfg->chunk_pad_size     = 63488;  /* 62KB: fits in one IPv4 UDP datagram (max 65451) */
   cfg->zstd_level         = 3;
   cfg->ghost_chunks_enabled = true;
   cfg->ghost_chunk_min    = 5;
@@ -2240,8 +2252,8 @@ return MPCP_OK;
   fprintf(stderr,"[config] chunk_pad_size too small (< 1024)\n");
   return MPCP_ERR_PARAM;
   }
-  if (cfg->chunk_pad_size > 131072u) {
-  fprintf(stderr,"[config] chunk_pad_size too large (> 131072); recompile with larger SEND_PKT_MAX\n");
+  if (cfg->chunk_pad_size > 63488u) {
+  fprintf(stderr,"[config] chunk_pad_size too large (> 63488); must fit in UDP datagram with larger SEND_PKT_MAX\n");
   return MPCP_ERR_PARAM;
   }
   if (cfg->pipeline_depth == 0 || cfg->pipeline_depth > 8) {
@@ -4577,16 +4589,6 @@ return MPCP_OK;
 - S9.3  Build chunk plan
 - ----------------------------------- */
 
-/* Map compressed_size to target chunk size (spec S9.3 table) */
-static uint32_t target_chunk_size(size_t compressed_size)
-{
-if (compressed_size < (size_t)(1u << 20))           return 100u * 1024u;
-if (compressed_size < (size_t)(10u << 20))          return 100u * 1024u;
-if (compressed_size < (size_t)(100u << 20))         return 128u * 1024u;
-if (compressed_size < (size_t)(1u << 30))           return 128u * 1024u;
-return 256u * 1024u;
-}
-
 int mpcp_chunker_plan(size_t             compressed_size,
 uint32_t           chunk_pad_size,
 bool               skip_compression,
@@ -4595,7 +4597,11 @@ mpcp_chunk_plan_t *plan_out)
 if (!plan_out || chunk_pad_size == 0) return MPCP_ERR_PARAM;
 if (compressed_size == 0) return MPCP_ERR_PARAM;
 
-uint32_t target = target_chunk_size(compressed_size);
+/* Use chunk_pad_size as the target chunk size.
+ * target_chunk_size() returns 100-256KB which exceeds the UDP max payload
+ * of 65507 bytes once wire overhead is added. chunk_pad_size is the
+ * configured maximum that fits in one UDP datagram. */
+uint32_t target = chunk_pad_size;
 
 /* Round up: at least 1 chunk */
 uint32_t n = (uint32_t)((compressed_size + target - 1u) / target);
@@ -4639,17 +4645,37 @@ return MPCP_OK;
   uint8_t       *ct_out,
   size_t        *ct_len_out,
   uint8_t        nonce_out[24],
-  uint8_t        flags)
+  uint8_t        flags,
+  uint32_t       chunk_pad_size)
   {
   if (!plaintext || !chunk_key || !session_nonce ||
   !ct_out || !ct_len_out || !nonce_out)
   return MPCP_ERR_PARAM;
-  
-  /* Delegate to crypto module which handles pad + AEAD */
   (void)flags;  /* flags are in the wire header, not in the ciphertext */
-  return mpcp_chunk_encrypt(chunk_key, session_nonce, seq,
-  plaintext, (size_t)plaintext_len,
-  ct_out, ct_len_out, nonce_out);
+
+  /* S9.4: Pad plaintext to chunk_pad_size with random bytes before encrypting.
+   * This ensures all data chunks have identical wire size (chunk_pad_size + 16),
+   * indistinguishable from ghost chunks. Without padding, variable-length data
+   * chunks may exceed the IPv4 UDP max (65507 bytes). */
+  uint32_t pad_size = chunk_pad_size;
+  if (plaintext_len > pad_size) {
+      /* Should never happen if chunker_plan set target = chunk_pad_size */
+      fprintf(stderr, "[chunker] BUG: plaintext_len %u > chunk_pad_size %u\n",
+              plaintext_len, pad_size);
+      return MPCP_ERR_PARAM;
+  }
+  uint8_t *padded = malloc(pad_size);
+  if (!padded) return MPCP_ERR_ALLOC;
+  memcpy(padded, plaintext, plaintext_len);
+  if (plaintext_len < pad_size)
+      randombytes_buf(padded + plaintext_len, pad_size - plaintext_len);
+
+  int rc = mpcp_chunk_encrypt(chunk_key, session_nonce, seq,
+                               padded, pad_size,
+                               ct_out, ct_len_out, nonce_out);
+  sodium_memzero(padded, pad_size);
+  free(padded);
+  return rc;
   }
 
 /* -------------------------
@@ -5196,20 +5222,7 @@ return fd;
 - An unbound SOCK_DGRAM socket gets an ephemeral source port assigned by the OS
 - on the first sendto(), which is correct - the source port is not part of the
 - protocol. */
-  static int open_udp_send_socket(void)
-  {
-  return socket(AF_INET, SOCK_DGRAM, 0);
-  }
-
-static void close_after_ms(int fd, uint32_t window_ms)
-{
-/* Block for window_ms then close (used by receiver catch thread) */
-struct timespec ts;
-ts.tv_sec  = window_ms / 1000u;
-ts.tv_nsec = (long)(window_ms % 1000u) * 1000000L;
-nanosleep(&ts, NULL);
-close(fd);
-}
+/* open_udp_send_socket and close_after_ms removed — no longer used */
 
 /* =========================================================================
 
@@ -5255,6 +5268,8 @@ for (uint32_t i = 0; i < ctx->plan.n_chunks; i++) {
     mpcp_ring_publish(&ctx->ring0, slot);
     (void)base;
 }
+/* Signal compressor that reader is done producing into ring0 */
+atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
 return NULL;
 
 }
@@ -5270,11 +5285,16 @@ compress_arg_t    *a   = arg;
 mpcp_sender_ctx_t *ctx = a->ctx;
 
 for (;;) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
-        break;
-
     mpcp_ring_slot_t *in = mpcp_ring_consume(&ctx->ring0);
-    if (!in) { sched_yield(); continue; }
+    if (!in) {
+        /* Exit only when ring0 is empty AND T1 is done producing into it */
+        if (atomic_load_explicit(&ctx->t1_done, memory_order_acquire))
+            break;
+        if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
+            break;
+        sched_yield();
+        continue;
+    }
 
     mpcp_ring_slot_t *out = mpcp_ring_claim(&ctx->ring1);
     out->seq_index = in->seq_index;
@@ -5312,6 +5332,8 @@ for (;;) {
     /* Check for last chunk */
     if (out->flags & MPCP_FLAG_LAST_CHUNK) break;
 }
+/* Signal crypto thread that compressor is done producing into ring1 */
+atomic_store_explicit(&ctx->t2_done, true, memory_order_release);
 return NULL;
 
 }
@@ -5327,11 +5349,16 @@ crypto_arg_t      *a   = arg;
 mpcp_sender_ctx_t *ctx = a->ctx;
 
 for (;;) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
-        break;
-
     mpcp_ring_slot_t *in = mpcp_ring_consume(&ctx->ring1);
-    if (!in) { sched_yield(); continue; }
+    if (!in) {
+        /* Exit only when ring1 is empty AND T2 is done producing into it */
+        if (atomic_load_explicit(&ctx->t2_done, memory_order_acquire))
+            break;
+        if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
+            break;
+        sched_yield();
+        continue;
+    }
 
     mpcp_ring_slot_t *out = mpcp_ring_claim(&ctx->ring2);
     out->seq_index = in->seq_index;
@@ -5353,7 +5380,8 @@ for (;;) {
                  ctx->sess->session_nonce,
                  in->seq_index,
                  out->buf, &out->ct_len,
-                 out->nonce, in->flags);
+                 out->nonce, in->flags,
+                 ctx->cfg->chunk_pad_size);
 
     sodium_memzero(chunk_key, sizeof(chunk_key));
 
@@ -5392,9 +5420,9 @@ bool try_zerocopy)
  * hdr(6) + seq(4) + retry(1) + flags(1) + plen(4) + nonce(24) + ciphertext
  *
  * OPT: stack-allocated packet buffer - eliminates malloc/free per chunk.
- * Max size: MPCP_DATA_HDR_OFFSET(40) + chunk_pad_size(131072) + tag(16) = 131128.
+ * Max size: MPCP_DATA_HDR_OFFSET(40) + chunk_pad_size(63488) + tag(16) = 63544.
  * Using a fixed upper bound avoids VLA and heap allocation. */
-#define SEND_PKT_MAX (MPCP_DATA_HDR_OFFSET + 131072u + 16u)
+#define SEND_PKT_MAX (MPCP_DATA_HDR_OFFSET + 63488u + 16u)
     uint8_t pkt_stack[SEND_PKT_MAX];
     size_t  pkt_len = (size_t)MPCP_DATA_HDR_OFFSET + slot->ct_len;
     uint8_t *pkt    = (pkt_len <= SEND_PKT_MAX) ? pkt_stack : NULL;
@@ -5425,6 +5453,10 @@ ssize_t sent = sendto(sock, pkt, pkt_len, 0,
                       (const struct sockaddr *)(const void *)peer,
                       sizeof(*peer));
 
+if (sent < 0)
+    fprintf(stderr, "[send_chunk] sendto seq=%u len=%zu FAILED: %s\n",
+            slot->seq_index, pkt_len, strerror(errno));
+
 return (sent > 0) ? MPCP_OK : MPCP_ERR_IO;
 
 }
@@ -5436,18 +5468,22 @@ mpcp_sender_ctx_t *ctx = a->ctx;
 
 uint32_t  ghost_idx = 0;
 uint32_t  total_sent = 0;
-uint32_t  expected = ctx->plan.n_chunks
-                     + (ctx->cfg->ghost_chunks_enabled ? ctx->ghost_count : 0u);
+uint32_t  data_consumed = 0; /* separate counter — exits main loop when all data drained */
 
 /* Open one persistent send socket for all data and ghost chunks.
  * Eliminates the open()/close() syscall pair per chunk. */
-int persist_sock = open_udp_send_socket();
+/* Use the ack_sock as our send socket — this is critical.
+ * When receiver gets a chunk from us, it sees our source IP:port.
+ * It sends the ACK back to that IP:port. If we used a separate socket,
+ * ACKs would arrive on a port nobody is listening on. By using ack_sock
+ * for sends, the receiver's ACK naturally returns to ack_sock. */
+int persist_sock = a->ack_sock;
 if (persist_sock < 0) {
     atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
     return NULL;
 }
 
-while (total_sent < expected) {
+while (data_consumed < ctx->plan.n_chunks) { /* exit when all DATA chunks sent; ghost drain follows */
     if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
         break;
 
@@ -5461,9 +5497,11 @@ while (total_sent < expected) {
     memcpy(&dest, ctx->peer_addr, sizeof(dest));
     dest.sin_port = htons(port);
 
+    fprintf(stderr, "[send] seq %u -> port %u\n", seq, port);
     (void)send_chunk_packet(persist_sock, &dest, ctx->sess, slot,
                              MPCP_TYPE_DATA_CHUNK, 0,
                              ctx->cfg->zerocopy);
+    data_consumed++;
 
     /* Cache encrypted chunk for possible retry */
     if (seq < ctx->plan.n_chunks && ctx->retry_cache && !ctx->retry_cache[seq]) {
@@ -5538,13 +5576,58 @@ while (total_sent < expected) {
     }
 
     mpcp_ring_release(&ctx->ring2, slot);
-}  /* end while (total_sent < expected) */
+}  /* end while: all DATA chunks consumed from ring2 and sent */
 
-/* Close the persistent send socket — retry scan opens its own per attempt */
-close(persist_sock);
+/* Drain any remaining ghost chunks that weren't interleaved.
+ * This happens when ghost_count > n_chunks (common for small files).
+ * Without this loop the while above spins forever on empty ring2. */
+while (ghost_idx < ctx->ghost_count &&
+       !atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) {
+    uint32_t gseq  = ctx->ghost_seqs[ghost_idx++];
+    uint16_t gport = chunk_port(ctx->sess, ctx->cfg, gseq);
 
-/* Retry scan: check for unacked chunks and resend until all acked or exhausted */
+    uint8_t  gkey[32]; uint16_t _gp2;
+    mpcp_keystream_slot(ctx->sess->keystream, gseq,
+                        ctx->cfg->port_base, ctx->cfg->port_range,
+                        gkey, &_gp2);
+
+    size_t  gct_len;
+    uint8_t gnonce[24];
+    size_t  gbuf_sz = (size_t)ctx->cfg->chunk_pad_size + 16u;
+    uint8_t *gbuf   = malloc(gbuf_sz);
+    if (gbuf) {
+        if (mpcp_chunker_generate_ghost(gkey, ctx->sess->session_nonce,
+                                        gseq, ctx->cfg->chunk_pad_size,
+                                        gbuf, &gct_len, gnonce) == MPCP_OK) {
+            struct sockaddr_in gdest;
+            memcpy(&gdest, ctx->peer_addr, sizeof(gdest));
+            gdest.sin_port = htons(gport);
+            mpcp_ring_slot_t gslot;
+            memset(&gslot, 0, sizeof(gslot));
+            gslot.seq_index = gseq;
+            gslot.data_len  = ctx->cfg->chunk_pad_size;
+            gslot.buf       = gbuf;
+            gslot.ct_len    = gct_len;
+            memcpy(gslot.nonce, gnonce, 24);
+            (void)send_chunk_packet(persist_sock, &gdest, ctx->sess, &gslot,
+                                    MPCP_TYPE_GHOST_CHUNK, 0, ctx->cfg->zerocopy);
+            sodium_memzero(gbuf, gbuf_sz);
+        }
+        free(gbuf);
+    }
+    sodium_memzero(gkey, sizeof(gkey));
+    total_sent++;
+}
+
+/* persist_sock is ack_sock (owned by sender_run) — do not close here */
+
+/* Retry scan: check for unacked chunks and resend until all acked or exhausted.
+ * Wait 500ms after initial sends before first retry pass — gives ACKs time
+ * to arrive for chunks that were already received. */
 {
+    struct timespec wait500 = {0, 500000000L};
+    nanosleep(&wait500, NULL);
+
     uint64_t retry_timeout_ns = (uint64_t)(ctx->cfg->chunk_retry_timeout * 1e9);
     uint32_t max_retries = 8;
     uint32_t still_unacked;
@@ -5564,13 +5647,13 @@ close(persist_sock);
                 atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
                 return NULL;
             }
-            uint16_t rport = mpcp_retry_port(ctx->sess->session_key,
-                                              ctx->sess->session_nonce,
-                                              i, max_retries,
-                                              ctx->cfg->port_base,
-                                              ctx->cfg->port_range);
-            int rsock = open_udp_send_socket();
-            if (rsock >= 0) {
+            /* Resend to the ORIGINAL keystream-derived port for this chunk.
+             * The receiver already has that port bound and is polling it.
+             * Using mpcp_retry_port() sends to a different port the receiver
+             * never bound, so retries were always silently dropped. */
+            uint16_t rport = chunk_port(ctx->sess, ctx->cfg, i);
+            /* Retry via ack_sock (same socket receiver sends ACKs to) */
+            {
                 struct sockaddr_in rdest = *ctx->peer_addr;
                 rdest.sin_port = htons(rport);
                 mpcp_ring_slot_t rslot;
@@ -5581,10 +5664,9 @@ close(persist_sock);
                 rslot.flags     = ctx->retry_flags[i];
                 rslot.buf       = ctx->retry_cache[i];
                 memcpy(rslot.nonce, ctx->retry_nonces[i], 24);
-                (void)send_chunk_packet(rsock, &rdest, ctx->sess, &rslot,
+                (void)send_chunk_packet(a->ack_sock, &rdest, ctx->sess, &rslot,
                                         MPCP_TYPE_DATA_CHUNK, (uint8_t)max_retries,
                                         false);
-                close(rsock);
                 ctx->sent_time_ns[i] = mpcp_now_ns();
                 still_unacked++;
             }
@@ -5773,6 +5855,8 @@ return NULL;
   ghost_count * sizeof(uint32_t));
   atomic_store_explicit(&ctx.acks_received, 0u, memory_order_relaxed);
   atomic_store_explicit(&ctx.abort_flag, false, memory_order_relaxed);
+  atomic_store_explicit(&ctx.t1_done,    false, memory_order_relaxed);
+  atomic_store_explicit(&ctx.t2_done,    false, memory_order_relaxed);
   mpcp_dedup_init(&ctx.ack_dedup);
 
   /* Retry cache: store one encrypted copy of each data chunk for retransmission */
@@ -5802,12 +5886,23 @@ return NULL;
     goto cleanup_fd;
     if ((rc = mpcp_ring_init(&ctx.ring1, cfg->ring_depth, max_chunk_bytes)) != MPCP_OK)
     goto cleanup_ring0;
-    if ((rc = mpcp_ring_init(&ctx.ring2, cfg->ring_depth, cfg->chunk_pad_size)) != MPCP_OK)
+    if ((rc = mpcp_ring_init(&ctx.ring2, cfg->ring_depth, cfg->chunk_pad_size + 16u)) != MPCP_OK)
     goto cleanup_ring1;
   
-  /* ACK socket */
+  /* ACK socket — also used as the persistent send socket so that ACK
+   * replies from the receiver reach this same fd (source port matches). */
   int ack_sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (ack_sock < 0) { rc = MPCP_ERR_IO; goto cleanup_ring2; }
+  /* Bind to INADDR_ANY:0 so OS assigns a stable ephemeral port. All chunk
+   * sends use this socket, so receiver ACKs come back here. */
+  {
+      struct sockaddr_in ack_bind;
+      memset(&ack_bind, 0, sizeof(ack_bind));
+      ack_bind.sin_family      = AF_INET;
+      ack_bind.sin_addr.s_addr = INADDR_ANY;
+      ack_bind.sin_port        = 0; /* OS picks ephemeral port */
+      (void)bind(ack_sock, (struct sockaddr *)&ack_bind, sizeof(ack_bind));
+  }
   
   /* - Launch threads - */
   reader_arg_t  r_arg  = { &ctx };
@@ -5901,81 +5996,148 @@ static void *thread_receiver_t1(void *arg)
 recv_t1_arg_t       *a   = arg;
 mpcp_receiver_ctx_t *ctx = a->ctx;
 
-for (uint32_t seq = 0; seq < a->n_chunks; seq++) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
-        break;
+/* DESIGN FIX: bind ALL chunk ports simultaneously before receiving anything.
+ *
+ * The original sequential design bound one port at a time and blocked for
+ * catch_window_ms before moving to the next. The sender sends all chunks in
+ * rapid succession to different ports. Sequential binding means chunks for
+ * later ports arrive while the receiver is still blocked on an earlier port —
+ * those packets hit unbound sockets, are silently dropped, and never retried.
+ *
+ * Fix: bind all n_chunks ports upfront, then poll all of them with MSG_DONTWAIT
+ * in a round-robin loop until every data chunk is received or the overall
+ * deadline expires. Ghost chunks are accepted and discarded inline. */
 
-    uint16_t port = a->ports[seq];
-    int fd = open_udp_socket_on_port(port);
-    if (fd < 0) continue;
+uint32_t n = a->n_chunks;
+size_t pkt_max = (size_t)MPCP_DATA_HDR_OFFSET
+                 + (size_t)ctx->cfg->chunk_pad_size + 16u;
 
-    struct timeval tv;
-    tv.tv_sec  = (time_t)(a->catch_window_ms / 1000u);
-    tv.tv_usec = (suseconds_t)((a->catch_window_ms % 1000u) * 1000u);
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    size_t  pkt_max = (size_t)MPCP_DATA_HDR_OFFSET
-                      + (size_t)ctx->cfg->chunk_pad_size + 16u;
-    uint8_t *pkt    = malloc(pkt_max);
-    if (!pkt) { close(fd); continue; }
-
-    struct sockaddr_in from_sender;
-    socklen_t from_len = sizeof(from_sender);
-    ssize_t n = recvfrom(fd, pkt, pkt_max, 0,
-                         (struct sockaddr *)&from_sender, &from_len);
-    close_after_ms(fd, 0);
-
-    if (n < (ssize_t)MPCP_DATA_HDR_OFFSET) {
-        free(pkt);
-        continue;
-    }
-
-    /* Reject packets not from the expected sender IP.
-     * Prevents injection of forged chunks from other LAN hosts.
-     * AEAD decryption catches forged ciphertext, but rejecting here
-     * avoids burning decryption time on adversarial traffic. */
-    if (from_sender.sin_addr.s_addr != ctx->peer_addr->sin_addr.s_addr) {
-        free(pkt);
-        continue;
-    }
-
-    /* Validate header */
-    uint32_t magic;
-    memcpy(&magic, pkt, 4);
-    if (ntohl(magic) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) {
-        free(pkt);
-        continue;
-    }
-    if (pkt[5] != MPCP_TYPE_DATA_CHUNK && pkt[5] != MPCP_TYPE_GHOST_CHUNK) {
-        free(pkt);
-        continue;
-    }
-
-    uint32_t pkt_seq;
-    memcpy(&pkt_seq, pkt + 6, 4);
-    pkt_seq = ntohl(pkt_seq);
-
-    /* Dedup check */
-    if (!mpcp_dedup_accept(&ctx->dedup, pkt_seq)) {
-        free(pkt);
-        continue;
-    }
-
-    mpcp_ring_slot_t *slot = mpcp_ring_claim(&ctx->ring0);
-    slot->seq_index = pkt_seq;
-    slot->flags     = pkt[11];
-
-    /* Copy ciphertext into slot */
-    size_t ct_len = (size_t)(n - (ssize_t)MPCP_DATA_HDR_OFFSET);
-    if (ct_len > slot->buf_capacity) ct_len = slot->buf_capacity;
-    memcpy(slot->buf, pkt + MPCP_DATA_HDR_OFFSET, ct_len);
-    slot->ct_len   = ct_len;
-    slot->data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12)); /* plaintext_len */
-    memcpy(slot->nonce, pkt + 16, 24);
-
-    free(pkt);
-    mpcp_ring_publish(&ctx->ring0, slot);
+/* Open all n sockets simultaneously */
+int *fds = calloc(n, sizeof(int));
+if (!fds) return NULL;
+for (uint32_t i = 0; i < n; i++) {
+    fds[i] = open_udp_socket_on_port(a->ports[i]);
+    if (fds[i] < 0)
+        fprintf(stderr, "[recv-t1] WARN: failed to bind port %u (seq %u): %s\n",
+                a->ports[i], i, strerror(errno));
+    else
+        fprintf(stderr, "[recv-t1] bound port %u -> seq %u\n", a->ports[i], i);
 }
+
+uint8_t *pkt = malloc(pkt_max);
+if (!pkt) { for (uint32_t i=0;i<n;i++) if(fds[i]>=0) close(fds[i]); free(fds); return NULL; }
+
+/* Deadline: generous to cover retransmits from sender */
+uint64_t deadline_ns = mpcp_now_ns()
+    + (uint64_t)ctx->cfg->chunk_retry_timeout * 3ULL * 1000000000ULL
+    + 30000000000ULL; /* +30s minimum */
+
+uint32_t received = 0;
+bool *got = calloc(n, sizeof(bool));
+if (!got) {
+    free(pkt);
+    for (uint32_t i=0;i<n;i++) if(fds[i]>=0) close(fds[i]);
+    free(fds);
+    return NULL;
+}
+
+while (received < n && mpcp_now_ns() < deadline_ns) {
+    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
+
+    bool any = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (got[i] || fds[i] < 0) continue;
+
+        struct sockaddr_in from_sender;
+        socklen_t from_len = sizeof(from_sender);
+        ssize_t nb = recvfrom(fds[i], pkt, pkt_max, MSG_DONTWAIT,
+                              (struct sockaddr *)&from_sender, &from_len);
+        if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
+
+        /* Note: source IP check removed - AEAD authentication in mpcp_chunk_decrypt
+         * provides cryptographic rejection of any forged/injected packets.
+         * A strict IP filter caused silent drops when the sender's routing
+         * chose a different source interface than calibration pings used. */
+        (void)from_sender;
+
+        /* Validate header */
+        uint32_t magic;
+        memcpy(&magic, pkt, 4);
+        if (ntohl(magic) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
+        if (pkt[5] != MPCP_TYPE_DATA_CHUNK && pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
+
+        uint32_t pkt_seq;
+        memcpy(&pkt_seq, pkt + 6, 4);
+        pkt_seq = ntohl(pkt_seq);
+
+        /* Ghost chunk: discard, mark port done */
+        bool is_ghost = false;
+        for (uint32_t g = 0; g < ctx->ghost_count; g++) {
+            if (ctx->ghost_seqs[g] == pkt_seq) { is_ghost = true; break; }
+        }
+        if (is_ghost) {
+            got[i] = true;
+            received++;
+            any = true;
+            close(fds[i]); fds[i] = -1;
+            continue;
+        }
+
+        /* Dedup check */
+        if (!mpcp_dedup_accept(&ctx->dedup, pkt_seq)) continue;
+
+        mpcp_ring_slot_t *slot = mpcp_ring_claim(&ctx->ring0);
+        slot->seq_index = pkt_seq;
+        slot->flags     = pkt[11];
+
+        size_t ct_len = (size_t)(nb - (ssize_t)MPCP_DATA_HDR_OFFSET);
+        if (ct_len > slot->buf_capacity) ct_len = slot->buf_capacity;
+        memcpy(slot->buf, pkt + MPCP_DATA_HDR_OFFSET, ct_len);
+        slot->ct_len   = ct_len;
+        slot->data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12));
+        memcpy(slot->nonce, pkt + 16, 24);
+        mpcp_ring_publish(&ctx->ring0, slot);
+
+        /* Send ACK back to sender — must be exactly MPCP_ACK_PKT_LEN=32 bytes.
+         * Sender ack_handler drops any packet smaller than 32 bytes.
+         * Layout: hdr(6) + ack_seq(4) + ack_hash(4) + padding(18) = 32. */
+        {
+            mpcp_ack_pkt_t ack;
+            memset(&ack, 0, sizeof(ack));
+            uint32_t ack_magic_be = htonl(MPCP_MAGIC);
+            memcpy(&ack.hdr.magic, &ack_magic_be, 4);
+            ack.hdr.version = MPCP_VERSION;
+            ack.hdr.type    = MPCP_TYPE_ACK;
+            uint32_t ack_seq_be = htonl(pkt_seq);
+            memcpy(&ack.ack_seq, &ack_seq_be, 4);
+            uint8_t ack_hash_bytes[4];
+            if (mpcp_ack_hash(ctx->sess->session_key, pkt_seq, ack_hash_bytes) == MPCP_OK)
+                memcpy(&ack.ack_hash, ack_hash_bytes, 4);
+            randombytes_buf(ack.padding, sizeof(ack.padding)); /* random padding */
+            sendto(fds[i], &ack, sizeof(ack), 0,
+                   (const struct sockaddr *)&from_sender, from_len);
+        }
+
+        fprintf(stderr, "[recv-t1] got seq %u on port %u\n",
+                pkt_seq, a->ports[i]);
+        got[i] = true;
+        received++;
+        any = true;
+        close(fds[i]); fds[i] = -1;
+    }
+    if (!any) {
+        struct timespec ts = {0, 1000000L}; /* 1ms */
+        nanosleep(&ts, NULL);
+    }
+}
+fprintf(stderr, "[recv-t1] done: received %u/%u chunks\n", received, n);
+
+free(got);
+free(pkt);
+for (uint32_t i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
+free(fds);
+/* Signal downstream stages that T1 has finished producing into ring0 */
+atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
 return NULL;
 
 }
@@ -5989,11 +6151,14 @@ verifier_arg_t      *a   = arg;
 mpcp_receiver_ctx_t *ctx = a->ctx;
 
 for (;;) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
-        break;
-
     mpcp_ring_slot_t *in = mpcp_ring_consume(&ctx->ring0);
-    if (!in) { sched_yield(); continue; }
+    if (!in) {
+        /* Exit only after T1 finished and ring0 is drained */
+        if (atomic_load_explicit(&ctx->t1_done, memory_order_acquire)) break;
+        if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
+        sched_yield();
+        continue;
+    }
 
     uint32_t seq = in->seq_index;
 
@@ -6030,6 +6195,8 @@ for (;;) {
     mpcp_ring_publish(&ctx->ring1, out);
     atomic_fetch_add_explicit(&ctx->chunks_verified, 1u, memory_order_relaxed);
 }
+/* Signal T3 that T2 has finished producing into ring1 */
+atomic_store_explicit(&ctx->t2_done, true, memory_order_release);
 return NULL;
 
 }
@@ -6043,11 +6210,14 @@ decrypt_arg_t       *a   = arg;
 mpcp_receiver_ctx_t *ctx = a->ctx;
 
 for (;;) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
-        break;
-
     mpcp_ring_slot_t *in = mpcp_ring_consume(&ctx->ring1);
-    if (!in) { sched_yield(); continue; }
+    if (!in) {
+        /* Exit only after T2 finished and ring1 is drained */
+        if (atomic_load_explicit(&ctx->t2_done, memory_order_acquire)) break;
+        if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
+        sched_yield();
+        continue;
+    }
 
     uint32_t seq = in->seq_index;
     if (seq >= ctx->plan.n_chunks) {
@@ -6080,13 +6250,18 @@ for (;;) {
     sodium_memzero(chunk_key, sizeof(chunk_key));
 
     if (rc == MPCP_OK && seq < ctx->plan.n_chunks) {
-        /* Store decrypted data for ordered write - this malloc is unavoidable
-         * as each chunk lives until the writer flushes it in order */
+        /* Store decrypted data for ordered write.
+         * plain_len = chunk_pad_size (full padded block).
+         * in->data_len = original unpadded data (from wire header plen field).
+         * We store only the real data bytes — chunk_lens[seq] = data_len. */
+        uint32_t real_len = in->data_len;  /* unpadded data length from packet */
+        if (real_len == 0 || real_len > (uint32_t)plain_len)
+            real_len = (uint32_t)plain_len; /* safety fallback */
         if (!ctx->chunk_store[seq]) {
-            ctx->chunk_store[seq] = malloc(plain_len);
+            ctx->chunk_store[seq] = malloc(real_len);
             if (ctx->chunk_store[seq]) {
-                memcpy(ctx->chunk_store[seq], plain, plain_len);
-                ctx->chunk_lens[seq]  = (uint32_t)plain_len;
+                memcpy(ctx->chunk_store[seq], plain, real_len);
+                ctx->chunk_lens[seq]  = real_len;
                 ctx->chunk_ready[seq] = true;
             }
         }
@@ -6101,6 +6276,8 @@ for (;;) {
     out->seq_index = seq;
     mpcp_ring_publish(&ctx->ring2, out);
 }
+/* Signal T4 that T3 has finished populating chunk_store and ring2 */
+atomic_store_explicit(&ctx->t3_done, true, memory_order_release);
 return NULL;
 
 }
@@ -6117,11 +6294,20 @@ writer_arg_t        *a   = arg;
 mpcp_receiver_ctx_t *ctx = a->ctx;
 
 for (;;) {
-    if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
+    /* Exit cleanly when all data chunks have been written */
+    if (ctx->next_write_seq >= ctx->plan.n_chunks)
         break;
 
     mpcp_ring_slot_t *in = mpcp_ring_consume(&ctx->ring2);
-    if (!in) { sched_yield(); continue; }
+    if (!in) {
+        /* Exit only when ring2 is empty AND T3 is done populating chunk_store */
+        if (atomic_load_explicit(&ctx->t3_done, memory_order_acquire))
+            break;
+        if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
+            break;
+        sched_yield();
+        continue;
+    }
 
     /* Drain ring notification; actual write is from chunk_store in order */
     mpcp_ring_release(&ctx->ring2, in);
@@ -6142,14 +6328,18 @@ for (;;) {
                 if (dbuf) {
                     size_t dlen = ZSTD_decompress(dbuf, dbound, buf, len);
                     if (!ZSTD_isError(dlen)) {
+                        fprintf(stderr, "[writer] seq %u: decompress %u->%zu bytes\n", ws, len, dlen);
                         if (write(ctx->out_fd, dbuf, dlen) != (ssize_t)dlen)
                             atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
                         else
-                            resume_record(ctx->out_path, ws); /* reuse path field - see below */
+                            resume_record(ctx->out_path, ws);
+                    } else {
+                        fprintf(stderr, "[writer] seq %u: ZSTD_decompress FAILED (len=%u)\n", ws, len);
                     }
                     free(dbuf);
                 }
             } else {
+                fprintf(stderr, "[writer] seq %u: raw write %u bytes\n", ws, len);
                 if (write(ctx->out_fd, buf, len) != (ssize_t)len)
                     atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
                 else
@@ -6278,12 +6468,15 @@ return NULL;
   ctx.plan.n_chunks       = n_chunks;
   ctx.plan.chunk_pad_size = cfg->chunk_pad_size;
   
+  /* Ring buf must hold ciphertext = chunk_pad_size + 16 (AEAD tag).
+   * ring2 holds seq notifications only (tiny), but sized same for simplicity. */
+  uint32_t ring_slot_sz = cfg->chunk_pad_size + 16u;
   int rc;
-  if ((rc = mpcp_ring_init(&ctx.ring0, cfg->ring_depth, cfg->chunk_pad_size)) != MPCP_OK)
+  if ((rc = mpcp_ring_init(&ctx.ring0, cfg->ring_depth, ring_slot_sz)) != MPCP_OK)
   goto cleanup;
-  if ((rc = mpcp_ring_init(&ctx.ring1, cfg->ring_depth, cfg->chunk_pad_size)) != MPCP_OK)
+  if ((rc = mpcp_ring_init(&ctx.ring1, cfg->ring_depth, ring_slot_sz)) != MPCP_OK)
   goto cleanup_r0;
-  if ((rc = mpcp_ring_init(&ctx.ring2, cfg->ring_depth, cfg->chunk_pad_size)) != MPCP_OK)
+  if ((rc = mpcp_ring_init(&ctx.ring2, cfg->ring_depth, ring_slot_sz)) != MPCP_OK)
   goto cleanup_r1;
   
   /* Catch window (spec S7.3) */
@@ -6292,7 +6485,10 @@ return NULL;
   recv_t1_arg_t  t1_arg  = { &ctx, total_chunks, catch_ms, ports };
   verifier_arg_t t2_arg  = { &ctx };
   decrypt_arg_t  t3_arg  = { &ctx };
-  writer_arg_t   t4_arg  = { &ctx, !ctx.plan.skip_compression };
+  /* Use skip_compression from session (set by run_transfer from xfer_flags).
+   * ctx.plan.skip_compression is always false on receiver (never computed here). */
+  bool use_decomp = !sess->skip_compression;
+  writer_arg_t   t4_arg  = { &ctx, use_decomp };
   
   pthread_t t1, t2, t3, t4;
   pthread_create(&t1, NULL, thread_receiver_t1, &t1_arg);
@@ -6301,18 +6497,28 @@ return NULL;
   pthread_create(&t4, NULL, thread_writer,       &t4_arg);
   
   pthread_join(t1, NULL);
-  /* BUG-3 FIX: T1 has finished receiving all chunks.  T2 (verifier) and
-  - T3 (decryptor) loop on sched_yield() waiting for ring slots - they have
-  - no other exit condition.  Set abort_flag so they drain their current
-  - in-progress slots and then break out of their for(;;) loops.
-  - T4 (writer) exits independently when next_write_seq >= n_chunks. */
-    atomic_store_explicit(&ctx.abort_flag, true, memory_order_release);
+  /* T1 sets t1_done itself on exit (signals T2 to drain ring0 and exit).
+   * T2 sets t2_done → T3 exits → T3 sets t3_done → T4 exits.
+   * The stage-done chain guarantees no buffered work is lost.
+   * abort_flag remains as a hard-error/tripwire signal only. */
     pthread_join(t2, NULL);
     pthread_join(t3, NULL);
     pthread_join(t4, NULL);
   
-  rc = MPCP_OK;
-  resume_clear(out_path);  /* delete sidecar on success */
+  /* Verify all chunks were written before declaring success.
+   * abort_flag fires when T1 times out; if the writer hadn't finished by
+   * then, we have a partial file. Report failure so the caller can retry. */
+  if (ctx.next_write_seq < n_chunks) {
+    fprintf(stderr, "[pipeline] receiver: incomplete – wrote %u/%u chunks\n",
+            ctx.next_write_seq, n_chunks);
+    rc = MPCP_ERR_TIMEOUT;
+    /* Remove the empty/partial output file so no garbage is left on disk */
+    if (!resuming)
+        unlink(out_path);
+  } else {
+    rc = MPCP_OK;
+    resume_clear(out_path);  /* delete sidecar on success */
+  }
 
   /* S11 Silent termination - zero key material */
   sodium_memzero(sess->session_key,   MPCP_SESSION_KEY_LEN);
@@ -7070,7 +7276,7 @@ CHECK("T-04e: fast profile formula correct", fabs(cw - 18.0) < 0.001);
   randombytes_buf(session_nonce, 32);
   randombytes_buf(chunk_key,     32);
   
-  const size_t PT_LEN = 131072; /* chunk_pad_size */
+  const size_t PT_LEN = 63488; /* chunk_pad_size */
   uint8_t *plaintext = malloc(PT_LEN);
   uint8_t *ciphertext= malloc(PT_LEN + 64); /* +tag overhead */
   uint8_t *decrypted = malloc(PT_LEN);
@@ -7673,12 +7879,12 @@ sess->keystream = NULL;
   puts("T-09  Distributed remainder");
   
   /* Various sizes - all chunks should be within 1 byte of each other */
-  size_t test_sizes[] = { 1000, 102400, 1048576, 10485760 };
+  size_t test_sizes[] = { 1000, 102400, 1048576, 8062976 }; /* 8062976 = 127*63488, max chunks */
   for (size_t s = 0; s < sizeof(test_sizes)/sizeof(test_sizes[0]); s++) {
   size_t compressed_size = test_sizes[s];
   mpcp_chunk_plan_t plan;
   memset(&plan, 0, sizeof(plan));
-  int rc = mpcp_chunker_plan(compressed_size, 131072, false, &plan);
+  int rc = mpcp_chunker_plan(compressed_size, 63488, false, &plan);
   if (rc != MPCP_OK) {
   P3_FAIL("T-09 plan creation", "mpcp_chunker_plan failed");
   continue;
@@ -7720,7 +7926,7 @@ sess->keystream = NULL;
   memset(&sess, 0, sizeof(sess));
   make_session(&sess);
   
-  uint32_t chunk_pad_size = 131072;
+  uint32_t chunk_pad_size = 63488;
   uint32_t ghost_seq      = 10;
   
   uint8_t chunk_key[32];
@@ -8207,13 +8413,15 @@ sess->keystream = NULL;
   uint16_t _p;
   mpcp_keystream_slot(sess.keystream, 5, 10000, 55000, key, &_p);
   
-  uint8_t  ct[1000 + 16];
+  uint32_t chunk_pad_size = (uint32_t)sizeof(plain); /* pad = exact plaintext size for test */
+  uint8_t  ct[sizeof(plain) + 16];
   size_t   ct_len;
   uint8_t  nonce[24];
   
   int rc = mpcp_chunker_encrypt_chunk(plain, sizeof(plain),
   key, sess.session_nonce, 5,
-  ct, &ct_len, nonce, 0);
+  ct, &ct_len, nonce, 0,
+  chunk_pad_size);
   P3_CHECK("T-P3-07a encrypt OK", rc == MPCP_OK);
   P3_CHECK("T-P3-07b ciphertext length", ct_len == sizeof(plain) + 16u);
   
@@ -9840,6 +10048,7 @@ static int run_transfer(void)
                 size_t bound = ZSTD_compressBound(fsize);
                 uint8_t *raw = malloc(fsize);
                 uint32_t exact_chunks = 1;
+                uint8_t  xfer_skip_flag = 0; /* MPCP_FLAG_SKIP_COMPRESSION if file incompressible */
                 if (raw) {
                     FILE *pf = fopen(file_buf, "rb");
                     if (pf && fread(raw, 1, fsize, pf) == fsize) {
@@ -9847,11 +10056,19 @@ static int run_transfer(void)
                         uint8_t *tmp = malloc(bound);
                         if (tmp) {
                             size_t clen = ZSTD_compress(tmp, bound, raw, fsize, cfg.zstd_level);
-                            size_t csz  = ZSTD_isError(clen) ? fsize : clen;
+                            /* Match sender_run's compressibility threshold:
+                             * ratio > 0.95 → incompressible → use original fsize.
+                             * ZSTD_isError alone misses cases where ZSTD succeeds
+                             * but output is LARGER than input (e.g. JPEG/PNG),
+                             * which would cause n_chunks to diverge from sender_run. */
+                            bool zstd_err = (ZSTD_isError(clen) != 0);
+                            double ratio  = zstd_err ? 1.0 : (double)clen / (double)fsize;
+                            bool   sc     = zstd_err || (ratio > 0.95);
+                            size_t csz    = sc ? fsize : clen;
+                            if (sc) xfer_skip_flag = MPCP_FLAG_SKIP_COMPRESSION;
                             mpcp_chunk_plan_t plan;
                             memset(&plan, 0, sizeof(plan));
-                            if (mpcp_chunker_plan(csz, cfg.chunk_pad_size,
-                                                  ZSTD_isError(clen), &plan) == MPCP_OK)
+                            if (mpcp_chunker_plan(csz, cfg.chunk_pad_size, sc, &plan) == MPCP_OK)
                                 exact_chunks = plan.n_chunks;
                             free(tmp);
                         }
@@ -9859,7 +10076,7 @@ static int run_transfer(void)
                     free(raw);
                 }
                 (void)transfer_info_send(&sess, &cfg, &peer_addr,
-                                         exact_chunks, 0);
+                                         exact_chunks, xfer_skip_flag);
             }
         }
 
@@ -10001,11 +10218,12 @@ static int run_transfer(void)
             }
         }
 
+        /* Apply skip_compression from sender so writer doesn't try to
+         * ZSTD_decompress raw bytes (e.g. JPEG, PNG, already-compressed files). */
+        sess.skip_compression = (xfer_flags & MPCP_FLAG_SKIP_COMPRESSION) != 0;
+
         /* Step 4: Receive with live progress bar */
         banner("Receiving");
-        /* mpcp_receiver_run is blocking - we need to observe progress from
-         * outside. We hook a lightweight progress display using a separate
-         * call that wraps receiver_run with a polling thread. */
         {
             uint32_t recv_n = n_chunks;
             printf("  Expecting %u data chunks\n", recv_n);
