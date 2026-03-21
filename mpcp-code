@@ -1065,6 +1065,7 @@ mpcp_tripwire_t           tripwire;
 typedef struct {
 const mpcp_config_t      *cfg;
 mpcp_session_t           *sess;
+const struct sockaddr_in *peer_addr; /* sender IP — used to reject injected chunks */
 
 mpcp_chunk_plan_t         plan;
 
@@ -1118,10 +1119,11 @@ mpcp_tripwire_t           tripwire;
 - S10 / S19  Run receiver pipeline; blocks until complete or abort.
 - Writes reassembled file to out_path.
   */
-  int mpcp_receiver_run(const mpcp_config_t *cfg,
-  mpcp_session_t      *sess,
-  const char          *out_path,
-  uint32_t             n_chunks);
+  int mpcp_receiver_run(const mpcp_config_t      *cfg,
+  mpcp_session_t            *sess,
+  const struct sockaddr_in  *peer_addr,
+  const char                *out_path,
+  uint32_t                   n_chunks);
 
 /* =========================================================
 
@@ -2505,9 +2507,9 @@ pkt->hdr.type    = MPCP_TYPE_PING;
 /* Sequence number (big-endian) */
 pkt->seq = htons(seq);
 
-/* Timestamp: nanoseconds since epoch */
-uint64_t ts = mpcp_now_realns();
-/* Store as big-endian uint64 */
+/* Timestamp: CLOCK_MONOTONIC nanoseconds (informational field in packet,
+ * not used for RTT calculation — RTT uses local send_times[] array). */
+uint64_t ts = mpcp_now_ns();
 pkt->send_ts = __builtin_bswap64(ts);
 
 /* Nonce hint: first 16 bytes of session nonce */
@@ -2590,8 +2592,10 @@ return true;
   uint32_t this_batch = batch_end - batch_start;
   if (this_batch > 64) this_batch = 64; /* safety cap on batch size */
   
-   /* Record local send timestamps per ping in this batch */
-   uint64_t send_times[64];
+   /* Record local send timestamps per ping in this batch.
+    * Zero-init: slots not filled by sendto() stay 0 so pong matching
+    * detects "never sent" correctly on all compilers/optimisation levels. */
+   uint64_t send_times[64] = {0};
   
    /* Send all pings in this batch */
    for (uint32_t i = 0; i < this_batch; i++) {
@@ -2611,23 +2615,44 @@ return true;
            memcpy(wire_buf, &pkt, sizeof(pkt));
        }
   
-       /* Capture send time after serialisation, before syscall */
-       send_times[i] = mpcp_now_realns();
+       /* Capture send time with CLOCK_MONOTONIC: immune to NTP steps/slews.
+        * CLOCK_REALTIME can jump during calibration and corrupt RTT values.
+        * NOTE: timestamp is taken strictly before sendto() so it measures
+        * departure time, not post-syscall time. */
+       send_times[i] = mpcp_now_ns();
        sendto(sock_fd, wire_buf, wire_len, 0,
               (const struct sockaddr *)peer, sizeof(*peer));
-       fprintf(stderr, "\r  [ping %u/%u] sent...   ",
-               seq + i + 1, ping_count);
-       fflush(stderr);
+       /* No fprintf/fflush here: fflush is a blocking write syscall that
+        * adds variable jitter between consecutive pings in the batch.
+        * Progress is printed once after the full batch is sent. */
    }
+   /* Single progress line after burst: batch sent, now collecting pongs */
+   fprintf(stderr, "\r  [pings %u-%u/%u] sent, collecting pongs...   ",
+           seq + 1, seq + this_batch, ping_count);
+   fflush(stderr);
+   {
   
-   /* Collect pongs for this batch (best-effort, timeout per pong) */
+   /* Collect pongs for this batch (best-effort, timeout per pong).
+    * matched[] guards against duplicate pongs inflating collected count. */
    uint8_t recv_buf[MPCP_CAL_WIRE_BUF];
-   for (uint32_t i = 0; i < this_batch; i++) {
+   bool matched[64] = {false};  /* tracks which seqs already yielded an RTT */
+   uint32_t matched_count = 0;
+   for (uint32_t i = 0; i < this_batch && matched_count < this_batch; i++) {
+       struct sockaddr_in from_addr;
+       socklen_t from_len = sizeof(from_addr);
        ssize_t n = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0,
-                            NULL, NULL);
+                            (struct sockaddr *)&from_addr, &from_len);
        if (n < 0) continue; /* timeout or error - skip this pong */
   
-       uint64_t recv_ts = mpcp_now_realns();
+       /* Reject packets not from the expected peer IP.
+        * Without this, any UDP traffic on the LAN (another MPCP instance,
+        * a residual process, broadcast noise) can be counted as a valid
+        * pong, making calibration succeed when the receiver is not running. */
+       if (from_addr.sin_addr.s_addr != peer->sin_addr.s_addr) continue;
+       if ((size_t)n < sizeof(mpcp_cal_pkt_t)) continue;
+  
+       /* recv_ts: CLOCK_MONOTONIC for consistent delta with send_times[i] */
+       uint64_t recv_ts = mpcp_now_ns();
   
        /* Unwrap disguise if needed (in-place is safe: unwrap <= wrap size) */
        size_t payload_len = (size_t)n;
@@ -2647,16 +2672,21 @@ return true;
            /* Use local round-trip: recv_ts - send_times[j].
             * This avoids dependence on clock synchronisation between peers. */
            if (send_times[j] == 0) break; /* ping was never sent */
+           if (matched[j]) break;         /* duplicate pong - already counted */
            double rtt_ms = (double)(recv_ts - send_times[j]) / 1e6;
-           if (rtt_ms > 0.0 && rtt_ms < 60000.0) {
+           /* Accept 0.01ms–5000ms window. LAN RTT never exceeds a few hundred ms;
+            * values above 5s are stale packets or scheduler glitches. */
+           if (rtt_ms > 0.01 && rtt_ms < 5000.0) {
                rtts_out[collected++] = rtt_ms;
-               fprintf(stderr, "\r  [pong %zu] RTT %.2f ms   ",
-                       collected, rtt_ms);
-               fflush(stderr);
+               matched[j] = true;
+               matched_count++;
+               fprintf(stderr, "\r  [pong %zu/~%u] RTT %.2f ms   ",
+                       collected, ping_count, rtt_ms);
            }
            break;
        }
    }
+   } /* end pong collection block */
    seq += (uint16_t)this_batch;
   
   }
@@ -2708,15 +2738,20 @@ return true;
        memcpy(wire_buf, &pkt, sizeof(pkt));
    }
   
-   uint64_t send_ts = mpcp_now_realns();
+   /* CLOCK_MONOTONIC: stable across NTP adjustments */
+   uint64_t send_ts = mpcp_now_ns();
    sendto(sock_fd, wire_buf, wire_len, 0,
           (const struct sockaddr *)peer, sizeof(*peer));
   
    uint8_t recv_buf[MPCP_CAL_WIRE_BUF];
-   ssize_t n = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0, NULL, NULL);
+   struct sockaddr_in from_s; socklen_t flen_s = sizeof(from_s);
+   ssize_t n = recvfrom(sock_fd, recv_buf, sizeof(recv_buf), 0,
+                        (struct sockaddr *)&from_s, &flen_s);
    if (n < 0) continue;
+   if (from_s.sin_addr.s_addr != peer->sin_addr.s_addr) continue;
+   if ((size_t)n < sizeof(mpcp_cal_pkt_t)) continue;
   
-   uint64_t recv_ts = mpcp_now_realns();
+   uint64_t recv_ts = mpcp_now_ns();  /* CLOCK_MONOTONIC: matches send_ts */
   
    if (disguise) {
        size_t ul = mpcp_disguise_unwrap(recv_buf, (size_t)n,
@@ -2731,7 +2766,7 @@ return true;
   
    /* Use recv_ts - send_ts (local clock, avoids clock skew) */
    double rtt_ms = (double)(recv_ts - send_ts) / 1e6;
-   if (rtt_ms > 0.0 && rtt_ms < 60000.0)
+   if (rtt_ms > 0.01 && rtt_ms < 5000.0)
        rtts_out[collected++] = rtt_ms;
   
   }
@@ -2746,15 +2781,18 @@ return true;
   static void mini_recal(int sock_fd,
   const struct sockaddr_in *peer,
   const mpcp_config_t *cfg,
+  const uint8_t *session_nonce,   /* must match what pong_server captured */
   double *ewma_rtt_inout)
   {
   const int MINI_PINGS = 10;
   double rtts[10];
+  /* FIX: must pass the real session_nonce.
+   * The receiver's pong_server validates nonce_hint against the first ping.
+   * Passing a zeroed buffer meant every mini-recal ping was silently rejected
+   * (nonce mismatch) and no pongs were ever reflected, making the EWMA
+   * update a no-op. */
   size_t got = calibrate_standard(sock_fd, peer, MINI_PINGS, MINI_PINGS,
-  /* session_nonce not needed for mini-recal timing;
-  * use a zeroed hint - peer identifies by timing only */
-  (const uint8_t *)"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
-  "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+  session_nonce,
   rtts,
   cfg->disguise_calibration,
   cfg->disguise_protocol);
@@ -2948,7 +2986,7 @@ return true;
   
   /* Mini re-calibration: 10 pings, update EWMA */
   fprintf(stderr, "[calibrate] mini re-cal (10 pings)...\n");
-  mini_recal(sock, peer_addr, cfg, &result_out->ewma_rtt);
+  mini_recal(sock, peer_addr, cfg, sess->session_nonce, &result_out->ewma_rtt);
   
   /* Recompute catch window with updated EWMA */
   result_out->catch_window = compute_catch_window(
@@ -3054,7 +3092,10 @@ return true;
   cfg->disguise_calibration, cfg->disguise_protocol);
   close(sock);
   
-  if (n < 3) { free(rtts); return MPCP_ERR_TIMEOUT; }
+  /* Require at least 10 valid pong samples before declaring calibration
+   * successful. Getting fewer than 10 pongs out of 60-140 pings sent
+   * strongly indicates the receiver is not running. */
+  if (n < 10) { free(rtts); return MPCP_ERR_TIMEOUT; }
   
   int rc = rtt_pipeline(rtts, n, cfg, result_out);
   if (rc != MPCP_OK) { free(rtts); return rc; }
@@ -3916,33 +3957,71 @@ return rc;
   rc = MPCP_ERR_IO; goto done_pc1;
   }
   
-  fprintf(stderr, "[exchange] PC1: sending %u candidates\n", N);
+  /* Diagnostic: print master_secret prefix and first 3 derived ports.
+   * Both sides must show identical values or the PSK/nonce didn't match. */
+  fprintf(stderr, "[exchange] PC1: ms=%02x%02x%02x%02x nonce=%02x%02x%02x%02x\n",
+    sess->master_secret[0], sess->master_secret[1],
+    sess->master_secret[2], sess->master_secret[3],
+    sess->session_nonce[0],  sess->session_nonce[1],
+    sess->session_nonce[2],  sess->session_nonce[3]);
+  for (uint32_t _di = 0; _di < 3 && _di < N; _di++)
+    fprintf(stderr, "[exchange] PC1: kex_port[%u] = %u (fd=%d)\n",
+      _di, socks[_di].port, socks[_di].fd);
+  fprintf(stderr, "[exchange] PC1: sending %u candidates to %s\n", N, inet_ntoa(pc2_addr->sin_addr));
+  /* Pre-pack all N candidate packets once (crypto is expensive - do it once).
+   * Then retransmit every 500ms until PC2 returns N-1 or deadline expires.
+   *
+   * WHY RETRANSMIT: PC1 finishes calibration and sends instantly. PC2 is still
+   * in mini_recal / rtt_pipeline / derive_master_secret and hasn't called bind()
+   * on its recv_socks yet. The one-shot burst arrives at unbound ports and is
+   * silently dropped. Retransmitting at 500ms intervals ensures PC2 gets the
+   * packets once it's actually listening. PC2 ignores duplicates via got_key[i]. */
+  mpcp_key_pkt_t pc1_pkts[MPCP_MAX_CANDIDATES];
+  bool           pc1_ready[MPCP_MAX_CANDIDATES];
+  memset(pc1_ready, 0, sizeof(pc1_ready));
   for (uint32_t i = 0; i < N; i++) {
   if (socks[i].fd < 0) continue;
-  mpcp_key_pkt_t pkt;
   if (mpcp_kex_pack(sess->master_secret, cands_out->keys[i],
-  (uint8_t)i, 0x00, &pkt) != MPCP_OK) continue;
-  struct sockaddr_in dst = *pc2_addr;
-  dst.sin_port = htons(socks[i].port);
-  sendto(socks[i].fd, &pkt, sizeof(pkt), 0,
-  (struct sockaddr *)&dst, sizeof(dst));
+  (uint8_t)i, 0x00, &pc1_pkts[i]) == MPCP_OK)
+      pc1_ready[i] = true;
   }
-  
+
   /* Receive N-1 keys back; track which indices arrived */
   uint8_t recv_keys[MPCP_MAX_CANDIDATES][32];
   bool    received[MPCP_MAX_CANDIDATES];
   memset(recv_keys, 0, sizeof(recv_keys));
   memset(received,  0, sizeof(received));
-  
-  fprintf(stderr, "[exchange] PC1: waiting for N-1 keys from PC2\n");
-  uint64_t deadline = mpcp_now_ns() + 15000000000ULL; /* 15s */
+
+  fprintf(stderr, "[exchange] PC1: sending + waiting for N-1 keys from PC2\n");
+  uint64_t deadline    = mpcp_now_ns() + 15000000000ULL; /* 15s total */
+  uint64_t next_send   = 0; /* fire immediately on first iteration */
   while (mpcp_now_ns() < deadline) {
+  uint32_t cnt_before = 0;
+  for (uint32_t i = 0; i < N; i++) if (received[i]) cnt_before++;
+  if (cnt_before >= N - 1) break;
+
+  /* Retransmit all N candidate packets every 500ms */
+  if (mpcp_now_ns() >= next_send) {
+      for (uint32_t i = 0; i < N; i++) {
+      if (!pc1_ready[i]) continue;
+      struct sockaddr_in dst = *pc2_addr;
+      dst.sin_port = htons(socks[i].port);
+      sendto(socks[i].fd, &pc1_pkts[i], sizeof(pc1_pkts[i]), 0,
+      (struct sockaddr *)&dst, sizeof(dst));
+      }
+      fprintf(stderr, "[exchange] PC1: sent %u candidates (retransmit)\n", N);
+      next_send = mpcp_now_ns() + 500000000ULL; /* 500ms */
+  }
+
+  bool any_new = false;
   for (uint32_t i = 0; i < N; i++) {
   if (socks[i].fd < 0 || received[i]) continue;
   uint8_t buf[sizeof(mpcp_key_pkt_t)];
+  struct sockaddr_in from_pc2; socklen_t flen = sizeof(from_pc2);
   ssize_t n = recvfrom(socks[i].fd, buf, sizeof(buf),
-  MSG_DONTWAIT, NULL, NULL);
+  MSG_DONTWAIT, (struct sockaddr *)&from_pc2, &flen);
   if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
+  if (from_pc2.sin_addr.s_addr != pc2_addr->sin_addr.s_addr) continue;
   const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
   if (pkt->direction != 0x01) continue;
   uint8_t tmp[32];
@@ -3952,14 +4031,14 @@ return rc;
   if (idx < N && !received[idx]) {
   memcpy(recv_keys[idx], tmp, 32);
   received[idx] = true;
+  any_new = true;
   }
   sodium_memzero(tmp, 32);
   }
-  uint32_t cnt = 0;
-  for (uint32_t i = 0; i < N; i++) if (received[i]) cnt++;
-  if (cnt >= N - 1) break;
-  struct timespec ts = {0, 5000000L};
-  nanosleep(&ts, NULL);
+  if (!any_new) {
+      struct timespec ts = {0, 1000000L};
+      nanosleep(&ts, NULL);
+  }
   }
   sodium_memzero(recv_keys, sizeof(recv_keys));
 
@@ -4035,27 +4114,48 @@ return rc;
   return MPCP_ERR_ALLOC;
   }
   
-  /* Collect all N keys from PC1 (10s timeout) */
-  fprintf(stderr, "[exchange] PC2: waiting for %u candidate keys\n", N);
+  /* Collect all N keys from PC1.
+   * Use MSG_DONTWAIT (non-blocking) poll across all N sockets each pass.
+   * A blocking recvfrom-per-socket would stall up to 2s × N = 20s before
+   * the deadline is re-checked, causing guaranteed timeout with N=10. */
+  /* Diagnostic: must match PC1's output exactly */
+  fprintf(stderr, "[exchange] PC2: ms=%02x%02x%02x%02x nonce=%02x%02x%02x%02x\n",
+    sess->master_secret[0], sess->master_secret[1],
+    sess->master_secret[2], sess->master_secret[3],
+    sess->session_nonce[0],  sess->session_nonce[1],
+    sess->session_nonce[2],  sess->session_nonce[3]);
+  for (uint32_t _di = 0; _di < 3 && _di < N; _di++)
+    fprintf(stderr, "[exchange] PC2: kex_port[%u] = %u (fd=%d)\n",
+      _di, recv_socks[_di].port, recv_socks[_di].fd);
+  fprintf(stderr, "[exchange] PC2: waiting for %u candidate keys from PC1=%s\n",
+    N, inet_ntoa(pc1_addr->sin_addr));
   uint64_t deadline = mpcp_now_ns() + 10000000000ULL;
   while (mpcp_now_ns() < deadline) {
+  uint32_t cnt_check = 0;
+  for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt_check++;
+  if (cnt_check == N) break;
+  bool any_new = false;
   for (uint32_t i = 0; i < N; i++) {
   if (got_key[i] || recv_socks[i].fd < 0) continue;
   uint8_t buf[sizeof(mpcp_key_pkt_t)];
+  struct sockaddr_in from_pc1; socklen_t flen2 = sizeof(from_pc1);
   ssize_t n = recvfrom(recv_socks[i].fd, buf, sizeof(buf),
-  MSG_DONTWAIT, NULL, NULL);
+  MSG_DONTWAIT, (struct sockaddr *)&from_pc1, &flen2);
   if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
+  /* Validate packet came from the expected PC1 IP */
+  if (from_pc1.sin_addr.s_addr != pc1_addr->sin_addr.s_addr) continue;
   const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
   if (pkt->direction != 0x00) continue;
   if (mpcp_kex_unpack(sess->master_secret, pkt, all_keys[i]) != MPCP_OK)
   continue;
   got_key[i] = true;
+  any_new = true;
   }
-  uint32_t cnt = 0;
-  for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt++;
-  if (cnt == N) break;
-  struct timespec ts = {0, 1000000L};
-  nanosleep(&ts, NULL);
+  /* Sleep 1ms between passes unless we just received something */
+  if (!any_new) {
+      struct timespec ts = {0, 1000000L};
+      nanosleep(&ts, NULL);
+  }
   }
   close_kex_ports(recv_socks, N);
   free(recv_socks);
@@ -4146,8 +4246,9 @@ return rc;
   }
   }
   
-  /* Step 8: open N-1 ports, send shuffled return_buf in parallel.
-  - selected_idx port is skipped - PC1 identifies it as the chosen key. */
+  /* Step 8: open N-1 ports, pre-pack all packets, then burst-send.
+   * Separating crypto (pack) from network (sendto) prevents scheduler
+   * preemption between consecutive sends and minimises inter-packet jitter. */
     fprintf(stderr, "[exchange] PC2: returning %u keys to PC1\n", N - 1);
     {
     kex_sock_t *send_socks = calloc(N, sizeof(kex_sock_t));
@@ -4158,15 +4259,24 @@ return rc;
     open_kex_ports(sess->master_secret, sess->session_nonce,
     N, cfg->port_base, cfg->port_range,
     selected_idx, send_socks);
-    
+
+    /* Pre-pack all N-1 packets (crypto phase) */
+    mpcp_key_pkt_t pkts[MPCP_MAX_CANDIDATES];
+    bool           pkt_ready[MPCP_MAX_CANDIDATES];
+    memset(pkt_ready, 0, sizeof(pkt_ready));
     for (uint32_t i = 0; i < N; i++) {
     if (i == selected_idx || send_socks[i].fd < 0) continue;
-    mpcp_key_pkt_t pkt;
     if (mpcp_kex_pack(sess->master_secret, return_buf[i],
-    (uint8_t)i, 0x01, &pkt) != MPCP_OK) continue;
+    (uint8_t)i, 0x01, &pkts[i]) == MPCP_OK)
+        pkt_ready[i] = true;
+    }
+
+    /* Burst-send all ready packets (no crypto between sends) */
+    for (uint32_t i = 0; i < N; i++) {
+    if (!pkt_ready[i]) continue;
     struct sockaddr_in dst = *pc1_addr;
     dst.sin_port = htons(send_socks[i].port);
-    sendto(send_socks[i].fd, &pkt, sizeof(pkt), 0,
+    sendto(send_socks[i].fd, &pkts[i], sizeof(pkts[i]), 0,
     (struct sockaddr *)&dst, sizeof(dst));
     }
     close_kex_ports(send_socks, N);
@@ -5329,6 +5439,14 @@ uint32_t  total_sent = 0;
 uint32_t  expected = ctx->plan.n_chunks
                      + (ctx->cfg->ghost_chunks_enabled ? ctx->ghost_count : 0u);
 
+/* Open one persistent send socket for all data and ghost chunks.
+ * Eliminates the open()/close() syscall pair per chunk. */
+int persist_sock = open_udp_send_socket();
+if (persist_sock < 0) {
+    atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
+    return NULL;
+}
+
 while (total_sent < expected) {
     if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
         break;
@@ -5339,24 +5457,13 @@ while (total_sent < expected) {
     uint32_t seq  = slot->seq_index;
     uint16_t port = chunk_port(ctx->sess, ctx->cfg, seq);
 
-    /* BUG-1 FIX: sender uses an unbound socket and sends TO receiver:port[i].
-     * Receiver binds port[i] on its machine to catch the arriving datagram.
-     * Build a destination sockaddr combining peer IP with derived port. */
     struct sockaddr_in dest;
     memcpy(&dest, ctx->peer_addr, sizeof(dest));
     dest.sin_port = htons(port);
 
-    int sock = open_udp_send_socket();
-    if (sock < 0) {
-        mpcp_ring_release(&ctx->ring2, slot);
-        atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
-        break;
-    }
-
-    (void)send_chunk_packet(sock, &dest, ctx->sess, slot,
+    (void)send_chunk_packet(persist_sock, &dest, ctx->sess, slot,
                              MPCP_TYPE_DATA_CHUNK, 0,
                              ctx->cfg->zerocopy);
-    close(sock);
 
     /* Cache encrypted chunk for possible retry */
     if (seq < ctx->plan.n_chunks && ctx->retry_cache && !ctx->retry_cache[seq]) {
@@ -5399,7 +5506,8 @@ while (total_sent < expected) {
                 memcpy(&gdest, ctx->peer_addr, sizeof(gdest));
                 gdest.sin_port = htons(gport);
 
-                int gsock = open_udp_send_socket();
+                {
+                int gsock = persist_sock; /* reuse persistent socket */
                 if (gsock >= 0) {
                     /* Build a temporary slot for the ghost */
                     mpcp_ring_slot_t gslot;
@@ -5415,11 +5523,12 @@ while (total_sent < expected) {
                                              ctx->sess, &gslot,
                                              MPCP_TYPE_GHOST_CHUNK,
                                              0, ctx->cfg->zerocopy);
-                    close(gsock);
+                    /* gsock == persist_sock: do not close here */
                     /* BUG-5 FIX: always count ghost attempt so total_sent
                      * reaches expected and the loop exits even if gsock
                      * creation failed (failure already handled outside). */
                 }
+                } /* end gsock block */
                 total_sent++;   /* count regardless of send success */
                 sodium_memzero(gbuf, gbuf_sz);
             }
@@ -5429,6 +5538,64 @@ while (total_sent < expected) {
     }
 
     mpcp_ring_release(&ctx->ring2, slot);
+}  /* end while (total_sent < expected) */
+
+/* Close the persistent send socket — retry scan opens its own per attempt */
+close(persist_sock);
+
+/* Retry scan: check for unacked chunks and resend until all acked or exhausted */
+{
+    uint64_t retry_timeout_ns = (uint64_t)(ctx->cfg->chunk_retry_timeout * 1e9);
+    uint32_t max_retries = 8;
+    uint32_t still_unacked;
+    do {
+        still_unacked = 0;
+        uint64_t now = mpcp_now_ns();
+        for (uint32_t i = 0; i < ctx->plan.n_chunks; i++) {
+            if (!atomic_load_explicit(&ctx->sent_flag[i], memory_order_relaxed))
+                continue;
+            if (!ctx->retry_cache || !ctx->retry_cache[i])
+                continue;
+            if (now - ctx->sent_time_ns[i] < retry_timeout_ns) {
+                still_unacked++;
+                continue;
+            }
+            if (max_retries == 0) {
+                atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
+                return NULL;
+            }
+            uint16_t rport = mpcp_retry_port(ctx->sess->session_key,
+                                              ctx->sess->session_nonce,
+                                              i, max_retries,
+                                              ctx->cfg->port_base,
+                                              ctx->cfg->port_range);
+            int rsock = open_udp_send_socket();
+            if (rsock >= 0) {
+                struct sockaddr_in rdest = *ctx->peer_addr;
+                rdest.sin_port = htons(rport);
+                mpcp_ring_slot_t rslot;
+                memset(&rslot, 0, sizeof(rslot));
+                rslot.seq_index = i;
+                rslot.ct_len    = ctx->retry_cache_lens[i];
+                rslot.data_len  = ctx->retry_data_lens[i];
+                rslot.flags     = ctx->retry_flags[i];
+                rslot.buf       = ctx->retry_cache[i];
+                memcpy(rslot.nonce, ctx->retry_nonces[i], 24);
+                (void)send_chunk_packet(rsock, &rdest, ctx->sess, &rslot,
+                                        MPCP_TYPE_DATA_CHUNK, (uint8_t)max_retries,
+                                        false);
+                close(rsock);
+                ctx->sent_time_ns[i] = mpcp_now_ns();
+                still_unacked++;
+            }
+        }
+        if (still_unacked > 0) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
+            nanosleep(&ts, NULL);
+        }
+        max_retries--;
+    } while (still_unacked > 0 && max_retries > 0 &&
+             !atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed));
 }
 return NULL;
 
@@ -5488,69 +5655,10 @@ while (atomic_load_explicit(&ctx->acks_received, memory_order_relaxed)
             atomic_store_explicit(&ctx->sent_flag[ack_seq], false, memory_order_relaxed);
     }
 }
-
-/* Retry scan: after all initial sends, check for unacked chunks */
-{
-    uint64_t retry_timeout_ns = (uint64_t)(ctx->cfg->chunk_retry_timeout * 1e9);
-    uint32_t max_retries = 8;
-    uint32_t still_unacked;
-
-    do {
-        still_unacked = 0;
-        uint64_t now = mpcp_now_ns();
-        for (uint32_t i = 0; i < ctx->plan.n_chunks; i++) {
-            if (!atomic_load_explicit(&ctx->sent_flag[i], memory_order_relaxed))
-                continue; /* already acked */
-            if (!ctx->retry_cache || !ctx->retry_cache[i])
-                continue; /* never sent or no cache */
-            if (now - ctx->sent_time_ns[i] < retry_timeout_ns) {
-                still_unacked++;
-                continue; /* not timed out yet */
-            }
-            if (max_retries == 0) {
-                /* Exhausted retries - abort */
-                atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
-                return NULL;
-            }
-
-            /* Resend on retry port */
-            uint16_t rport = mpcp_retry_port(ctx->sess->session_key,
-                                              ctx->sess->session_nonce,
-                                              i, max_retries,
-                                              ctx->cfg->port_base,
-                                              ctx->cfg->port_range);
-            int rsock = open_udp_send_socket();
-            if (rsock >= 0) {
-                struct sockaddr_in rdest = *ctx->peer_addr;
-                rdest.sin_port = htons(rport);
-                /* Build a temporary slot for the retry */
-                mpcp_ring_slot_t rslot;
-                memset(&rslot, 0, sizeof(rslot));
-                rslot.seq_index = i;
-                rslot.ct_len    = ctx->retry_cache_lens[i];
-                rslot.data_len  = ctx->retry_data_lens[i];
-                rslot.flags     = ctx->retry_flags[i];
-                rslot.buf       = ctx->retry_cache[i];
-                memcpy(rslot.nonce, ctx->retry_nonces[i], 24);
-                (void)send_chunk_packet(rsock, &rdest, ctx->sess, &rslot,
-                                        MPCP_TYPE_DATA_CHUNK, (uint8_t)max_retries,
-                                        false);
-                close(rsock);
-                ctx->sent_time_ns[i] = mpcp_now_ns(); /* reset timer */
-                still_unacked++;
-            }
-        }
-        if (still_unacked > 0) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L }; /* 100ms */
-            nanosleep(&ts, NULL);
-        }
-        max_retries--;
-    } while (still_unacked > 0 && max_retries > 0 &&
-             !atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed));
-}
 return NULL;
 
 }
+
 
 /* =========================================================================
 
@@ -5811,10 +5919,22 @@ for (uint32_t seq = 0; seq < a->n_chunks; seq++) {
     uint8_t *pkt    = malloc(pkt_max);
     if (!pkt) { close(fd); continue; }
 
-    ssize_t n = recv(fd, pkt, pkt_max, 0);
+    struct sockaddr_in from_sender;
+    socklen_t from_len = sizeof(from_sender);
+    ssize_t n = recvfrom(fd, pkt, pkt_max, 0,
+                         (struct sockaddr *)&from_sender, &from_len);
     close_after_ms(fd, 0);
 
     if (n < (ssize_t)MPCP_DATA_HDR_OFFSET) {
+        free(pkt);
+        continue;
+    }
+
+    /* Reject packets not from the expected sender IP.
+     * Prevents injection of forged chunks from other LAN hosts.
+     * AEAD decryption catches forged ciphertext, but rejecting here
+     * avoids burning decryption time on adversarial traffic. */
+    if (from_sender.sin_addr.s_addr != ctx->peer_addr->sin_addr.s_addr) {
         free(pkt);
         continue;
     }
@@ -6054,10 +6174,11 @@ return NULL;
 
 - S10 / S19  mpcp_receiver_run - entry point
 - ====================================================================== */
-  int mpcp_receiver_run(const mpcp_config_t *cfg,
-  mpcp_session_t      *sess,
-  const char          *out_path,
-  uint32_t             n_chunks)
+  int mpcp_receiver_run(const mpcp_config_t      *cfg,
+  mpcp_session_t            *sess,
+  const struct sockaddr_in  *peer_addr,
+  const char                *out_path,
+  uint32_t                   n_chunks)
   {
   if (!cfg || !sess || !out_path || n_chunks == 0) return MPCP_ERR_PARAM;
 
@@ -6133,6 +6254,7 @@ return NULL;
   memset(&ctx, 0, sizeof(ctx));
   ctx.cfg          = cfg;
   ctx.sess         = sess;
+  ctx.peer_addr    = peer_addr;  /* used by thread_receiver_t1 to reject injected chunks */
   ctx.out_fd       = out_fd;
   ctx.out_path     = out_path;
   ctx.ghost_count  = ghost_count;
@@ -8231,8 +8353,11 @@ static void fw_open_ports(fw_type_t fw, uint16_t base, uint32_t range)
             sudo_run(cmd);
             break;
         case FW_IPTABLES:
+            /* -I INPUT 1 inserts at the TOP of the chain.
+             * -A appends to the END — any DROP/REJECT rule above it
+             * would match first and silently block all kex packets. */
             snprintf(cmd, sizeof(cmd),
-                "iptables -A INPUT -p udp --dport %u:%u -j ACCEPT 2>/dev/null",
+                "iptables -I INPUT 1 -p udp --dport %u:%u -j ACCEPT 2>/dev/null",
                 base, (uint16_t)top);
             sudo_run(cmd);
             break;
@@ -8259,6 +8384,7 @@ static void fw_close_ports(fw_type_t fw, uint16_t base, uint32_t range)
             sudo_run(cmd);
             break;
         case FW_IPTABLES:
+            /* Delete by full rule specification to match exactly what we inserted */
             snprintf(cmd, sizeof(cmd),
                 "iptables -D INPUT -p udp --dport %u:%u -j ACCEPT 2>/dev/null",
                 base, (uint16_t)top);
@@ -8983,19 +9109,22 @@ static int pong_server(const mpcp_config_t *cfg,
 
     /* Reflect pings for up to ping_count_max + grace.
      * Only exit on idle AFTER we have seen at least ping_count_min pings. */
-    uint32_t max_pings = cfg->ping_count_max + 20;
+    /* +30 head-room: +20 for loss/retransmit, +10 for mini_recal pings
+     * that arrive after the main calibration burst finishes. */
+    uint32_t max_pings = cfg->ping_count_max + 30;
     uint32_t reflected = 1; /* already counted the first one */
-    uint32_t min_before_idle = cfg->ping_count_min > 0 ? cfg->ping_count_min : 10u;
 
     while (reflected < max_pings) {
         ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&sender, &slen);
         if (n <= 0) {
-            /* Idle timeout fired - only exit if we have enough pings */
-            if (reflected >= min_before_idle) break;
-            /* Otherwise keep waiting - sender may not have started yet,
-             * reset the socket so we keep blocking */
-            continue;
+            /* Idle timeout fired — sender has stopped pinging.
+             * We are already in Phase 2 (got_first = true, nonce validated),
+             * so silence means the sender genuinely finished calibrating.
+             * Break immediately regardless of reflected count.
+             * The old min_before_idle guard caused the receiver to loop
+             * forever when packet loss meant reflected < ping_count_min. */
+            break;
         }
 
         /* Optionally unwrap disguise */
@@ -9048,8 +9177,11 @@ static int pong_server(const mpcp_config_t *cfg,
         sendto(fd, wire_buf, wire_len, 0,
                (struct sockaddr *)&sender, slen);
         reflected++;
-        fprintf(stderr, "\r  [ping %u] reflecting...   ", reflected);
-        fflush(stderr);
+        /* Print progress every 10 pings to avoid per-ping write() jitter */
+        if (reflected % 10 == 0 || reflected == 1) {
+            fprintf(stderr, "\r  [%u pings reflected]   ", reflected);
+            fflush(stderr);
+        }
     }
     fprintf(stderr, "\r  %u pings reflected -- calibration done        \n", reflected);
 
@@ -9091,11 +9223,12 @@ typedef struct {
 } bench_sender_arg_t;
 
 typedef struct {
-    mpcp_config_t  *cfg;
-    mpcp_session_t *sess;
-    const char     *out_path;
-    uint32_t        n_chunks;
-    int             rc;
+    mpcp_config_t       *cfg;
+    mpcp_session_t      *sess;
+    struct sockaddr_in   peer;   /* sender address for source validation */
+    const char          *out_path;
+    uint32_t             n_chunks;
+    int                  rc;
 } bench_receiver_arg_t;
 
 static void *bench_sender_thread(void *arg)
@@ -9108,7 +9241,8 @@ static void *bench_sender_thread(void *arg)
 static void *bench_receiver_thread(void *arg)
 {
     bench_receiver_arg_t *a = (bench_receiver_arg_t *)arg;
-    a->rc = mpcp_receiver_run(a->cfg, a->sess, a->out_path, a->n_chunks);
+    /* bench is always loopback; use the peer addr from bench args */
+    a->rc = mpcp_receiver_run(a->cfg, a->sess, &a->peer, a->out_path, a->n_chunks);
     return NULL;
 }
 
@@ -9207,7 +9341,7 @@ static int run_bench(void)
     peer.sin_port        = htons(cfg.port_base);
 
     bench_sender_arg_t   sarg = { &cfg, &sess_s, src_path, peer, 0 };
-    bench_receiver_arg_t rarg = { &cfg, &sess_r, dst_path, n_chunks, 0 };
+    bench_receiver_arg_t rarg = { &cfg, &sess_r, peer, dst_path, n_chunks, 0 };
 
     printf("  Starting loopback transfer...\n");
     uint64_t t0 = mpcp_now_ns();
@@ -9347,7 +9481,7 @@ static int run_selftest(void)
     peer.sin_port        = htons(cfg.port_base);
 
     bench_sender_arg_t   sa = { &cfg, &ss, src, peer, 0 };
-    bench_receiver_arg_t ra = { &cfg, &sr, dst, nc, 0 };
+    bench_receiver_arg_t ra = { &cfg, &sr, peer, dst, nc, 0 };
 
     pthread_t ts, tr;
     pthread_create(&tr, NULL, bench_receiver_thread, &ra);
@@ -9638,6 +9772,14 @@ static int run_transfer(void)
     spinner_t sp;
 
     if (is_sender) {
+        /* Open firewall for inbound kex packets before calibration.
+         * Key exchange (step 3) requires PC1 to send N candidate-key
+         * packets TO the sender's derived kex ports. Without opening the
+         * firewall here those inbound UDP packets are dropped and key
+         * exchange times out. The receiver already calls fw_maybe_open at
+         * the top of its block; we mirror that here for the sender. */
+        fw_maybe_open(cfg.port_base, cfg.port_range);
+
         /* =================================================================
          * SENDER (PC2) FLOW
          *
@@ -9868,7 +10010,7 @@ static int run_transfer(void)
             uint32_t recv_n = n_chunks;
             printf("  Expecting %u data chunks\n", recv_n);
             spinner_start(&sp, "  Receiving");
-            rc = mpcp_receiver_run(&cfg, &sess, file_buf, recv_n);
+            rc = mpcp_receiver_run(&cfg, &sess, &sender_addr, file_buf, recv_n);
             spinner_stop(&sp, rc == MPCP_OK);
         }
         if (rc == MPCP_OK) {
