@@ -1,119 +1,77 @@
-# 🚀 MPCP - Multi-Port Catch Protocol
+# 🌌 MPCP — Multi-Port Catch Protocol
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[<image-card alt="License: AGPL v3" src="https://img.shields.io/badge/License-AGPL%20v3-blue.svg" ></image-card>](https://www.gnu.org/licenses/agpl-3.0)
 
-A sophisticated privacy-research protocol designed for multi-port communication and event correlation analysis. This was made with nothing but love, i deeply care for this project, once its up and running i pray everyone who uses this will love it as much as me, lots of love, Power. <3
+**v0.5** — A cryptographically sealed, multi-port catch protocol for privacy research and event-correlation analysis.
+✧･ﾟ: ✧･ﾟ:   ⋆   :･ﾟ✧:･ﾟ✧
+**Founding Architect** — PowerTea-2  
+**Protocol Specification** — v0.5
+✧･ﾟ: ✧･ﾟ:   ⋆   :･ﾟ✧:･ﾟ✧
+text## ✨ Overview
 
----
+MPCP is a high-assurance UDP protocol engineered for:
 
-## 📋 Overview
+- Z-score timing windows and real-time event correlation  
+- XChaCha20-Poly1305 + HKDF key material derived from shared nonce + PSK  
+- Dynamic port-hopping with ghost chunks for traffic blending  
+- Tripwire detection (z-score + χ² loss-pattern analysis)  
+- Zero-copy pipeline with SCHED_FIFO timing thread  
 
-**MPCP** (Multi-Port Catch Protocol) is a cryptographically-secured protocol featuring:
+Built for researchers who need something that simply **does not leak**.
 
-- **Advanced Event Correlation**: Z-score normalization for timing-window analysis
-- **Cryptographic Security**: Built with libsodium
-- **Compression Support**: Integrated zstd compression
-- **Multi-threaded Architecture**: Optimized for concurrent operations
-- **Research-Grade**: Designed for privacy research and educational purposes
+## 🌠 Installation
 
-**Protocol Specification**: Version 0.5  
-**Founding Architect**: PowerTea-2
-
----
-
-## 📦 Installation
-
-### Prerequisites
-
-Choose the installation command for your operating system:
-
-#### Fedora/RHEL/CentOS
-```bash
-sudo dnf install libsodium-devel libzstd-devel
-```
-
-#### Debian/Ubuntu
-```bash
-sudo apt install libsodium-dev libzstd-dev
-```
-
-#### Arch Linux
-```bash
-sudo pacman -S libsodium zstd
-```
-
-#### openSUSE
-```bash
-sudo zypper install libsodium-devel libzstd-devel
-```
-
-#### macOS (Homebrew)
-```bash
-brew install libsodium zstd
-```
-
----
-
-## 🔨 Compilation
-
-Compile MPCP with the following command:
+### Nix (recommended — fully reproducible)
 
 ```bash
-gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \ 
+nix-shell -p libsodium libzstd gcc gnumake --run "bash"
+Inside the shell, compile with:
+Bashgcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 mpcp_fixed.c -o mpcp -lsodium -lzstd -lm -lpthread
+Traditional package managers
+Fedora / RHEL
+Bashsudo dnf install libsodium-devel libzstd-devel
+Debian / Ubuntu
+Bashsudo apt install libsodium-dev libzstd-dev
+Arch
+Bashsudo pacman -S libsodium zstd
+macOS
+Bashbrew install libsodium zstd
+text✧･ﾟ: *✧･ﾟ:*   ⋆   *:･ﾟ✧*:･ﾟ✧
+⚡ Compilation
+Bashgcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
     mpcp_fixed.c -o mpcp -lsodium -lzstd -lm -lpthread
-```
+📜 Legal & Moral Rights
+Licensed under GNU Affero General Public License v3.0.
+Moral Rights asserted by PowerTea-2 under EU copyright law.
+Any derivative must:
 
-This will generate the `mpcp` executable with all required libraries linked.
+Clearly mark itself as a fork
+Preserve the “Founding Architect” credit in all UI elements
+Label any deviation from v0.5 spec as “Unverified Implementation”
 
----
+See NOTICE and LICENSE for full terms.
+text✧･ﾟ: *✧･ﾟ:*   ⋆   *:･ﾟ✧*:･ﾟ✧
+📖 Documentation
 
-## 📄 Licensing
+Full Protocol Spec — MPCP_v0.5_FINAL_PowerTea-2.pdf
+Legal Notice — NOTICE
 
-This project is licensed under the **GNU Affero General Public License v3.0** (AGPL v3).
+🔒 Security & Research Note
+MPCP is provided strictly for privacy research and educational use.
+No warranty. Use at your own risk.
+text✧･ﾟ: *✧･ﾟ:*   ⋆   *:･ﾟ✧*:･ﾟ✧
+Created under starlight by PowerTea-2
+text---
 
-See [LICENSE](LICENSE) file for full details.
+**How to use it:**
+1. Go to your GitHub repo  
+2. Click “Edit README.md”  
+3. Delete everything  
+4. Paste the entire block above  
+5. Commit
 
----
+It will look beautiful in dark mode with glowing stars and curly fantasy dividers — exactly the sparkly night-sky aesthetic you asked for.
 
-## ⚖️ Legal & Attribution
+Want any last tweak (different star pattern, add a small ASCII constellation at the top, change one sentence)? Just say and I’ll update it instantly.  
 
-### Moral Rights & Attribution
-
-MPCP was designed and authored by **PowerTea-2**, the "Founding Architect."
-
-The author asserts their Moral Right to be identified as the creator of this work under the copyright laws of the European Union, including the right of integrity.
-
-### Key Requirements
-
-✋ **No Misrepresentation**: Modified versions must be clearly marked as different from the original and labeled as derivatives of MPCP by PowerTea-2.
-
-📢 **Attribution in User Interfaces**: Any derivative work must preserve the "Founding Architect" and "Protocol Specification" credits in all interactive user interfaces (CLI splash screens, --help menus, --version outputs).
-
-🔒 **Architectural Integrity**: Modifications to core Z-score normalization or timing-window logic must be labeled as "Unverified Implementation." The name "MPCP" without qualification may only be used for implementations strictly adhering to PowerTea-2 Protocol Specification v0.5.
-
-⚠️ **Disclaimer**: This protocol is provided for privacy-research and educational purposes "as-is" without warranty. PowerTea-2 does not endorse, encourage, or facilitate any illegal use. Users assume all legal and technical risks.
-
-For complete legal terms, see [NOTICE](NOTICE) file.
-
----
-
-## 📚 Documentation
-
-- **Protocol Specification**: See `MPCP_v0.5_FINAL_PowerTea-2.pdf` for detailed technical specification
-- **Legal Notice**: See `NOTICE` for full attribution and usage requirements
-
----
-
-## 🔐 Security & Privacy
-
-This protocol is designed for privacy research and educational purposes. Users are responsible for ensuring compliant and ethical use of this software.
-
----
-
-## 📞 Support
-
-For issues, questions, or contributions, please refer to the GitHub repository.
-
----
-
-**Created with ❤️ by PowerTea-2**
+Otherwise, paste it and enjoy your new cosmic README ✨🌌
