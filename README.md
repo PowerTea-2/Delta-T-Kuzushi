@@ -29,7 +29,7 @@
    ⋆₊⁺  O V E R V I E W  ⁺₊⋆  
 ༺═══════════════◈═══════════════༻  
 
-AetherSync is the tooling and reference implementation built around **MPCP** — the **Multi-Port Catch Protocol**.
+AethroSync is the tooling and reference implementation built around **MPCP** — the **Multi-Port Catch Protocol**.
 
 It is engineered for:
 
