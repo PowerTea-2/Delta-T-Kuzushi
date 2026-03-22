@@ -22,6 +22,8 @@
  * Config file:        ~/.config/mpcp/mpcp.conf
  */
 
+#define MPCP_COLOUR_UI 1
+
 /* =========================================================
 
 - System includes (deduplicated from all modules)
@@ -6277,6 +6279,31 @@ while (received < n && mpcp_now_ns() < deadline_ns) {
                    (const struct sockaddr *)&from_sender, from_len);
         }
 
+        /* Transfer animation */
+        if (!is_ghost) {
+            char src_ip[INET_ADDRSTRLEN] = "?";
+            if (ctx->peer_addr)
+                inet_ntop(AF_INET, &ctx->peer_addr->sin_addr, src_ip, sizeof(src_ip));
+            uint32_t data_done = 0;
+            for (uint32_t _d = 0; _d < n; _d++) if (got[_d]) data_done++;
+#ifdef MPCP_COLOUR_UI
+            {
+                int arr = 8 + (int)(28.0f * (float)data_done /
+                                    (float)(ctx->plan.n_chunks > 0 ? ctx->plan.n_chunks : 1));
+                fprintf(stderr, "  %s%-15s%s ", C_GREY, src_ip, C_RESET);
+                fprintf(stderr, "%s", C_VIOLET);
+                for (int _a = 0; _a < arr; _a++) fprintf(stderr, "â");
+                fprintf(stderr, "âº%s :%s%u%s  %sâ%s  seq%-2u  %.1f KB\n",
+                        C_RESET, C_PLUM, a->ports[i], C_RESET,
+                        C_LIME, C_RESET, pkt_seq,
+                        (double)slot->data_len / 1024.0);
+            }
+#else
+            fprintf(stderr, "  %-15s --> :%u  seq%-2u  %.1f KB\n",
+                    src_ip, a->ports[i], pkt_seq,
+                    (double)slot->data_len / 1024.0);
+#endif
+        }
         got[i] = true;
         received++;
         any = true;
@@ -9445,7 +9472,8 @@ static int transfer_info_recv(const mpcp_session_t *sess,
  * Returns 0 on success, -1 on bind failure. */
 static int pong_server(const mpcp_config_t *cfg,
                         struct sockaddr_in  *sender_addr_out,
-                        uint8_t             *nonce_hint_out)
+                        uint8_t             *nonce_hint_out,
+                        bool                 prompt_accept)
 {
     /* Bind on port_base so PC2 knows where to aim pings */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -9508,8 +9536,23 @@ static int pong_server(const mpcp_config_t *cfg,
         if (nonce_hint_out)
             memcpy(nonce_hint_out, ping->nonce_hint, MPCP_NONCE_HINT_LEN);
         got_first = true;
-        fprintf(stderr, "\r  [ping 1] received from %s -- sending pong        \n",
+        fprintf(stderr, "\r  [ping 1] received from %s              \n",
                 inet_ntoa(sender.sin_addr));
+
+        /* Server listen mode: ask operator before accepting */
+        if (prompt_accept) {
+            char ans[8];
+            fprintf(stderr, "  Accept connection from %s? [Y/n] ",
+                    inet_ntoa(sender.sin_addr));
+            fflush(stderr);
+            if (fgets(ans, sizeof(ans), stdin) == NULL || (ans[0] == 'n' || ans[0] == 'N')) {
+                fprintf(stderr, "  Connection rejected.\n");
+                close(fd);
+                return -2;  /* -2 = rejected, caller loops back */
+            }
+        } else {
+            fprintf(stderr, "  Sender identified — sending pong\n");
+        }
 
         /* Reflect this first ping immediately */
         mpcp_cal_pkt_t pong;
@@ -10086,15 +10129,63 @@ static int run_transfer(void)
     /* ---- Auth / PSK ---- */
     banner("Authentication");
     if (cfg.auth_mode == MPCP_AUTH_ED25519) {
-        printf("  Stealth profile uses Ed25519.\n");
+        printf("  Stealth mode — Ed25519 + PSK dual auth\n");
         printf("  Key directory: %s\n", cfg.auth_keydir);
-        if (ask_yn("  Generate new keypair?", false)) {
-            if (mpcp_ed25519_keygen(cfg.auth_keydir) == MPCP_OK)
-                printf("  -> keypair written to %s\n", cfg.auth_keydir);
-            else
-                mpcp_perror("ed25519 keygen", MPCP_ERR_CRYPTO);
+
+        /* Check for existing keys */
+        uint8_t _chk[32];
+        uint8_t _sk64[64] = {0};
+        bool has_sk   = (mpcp_ed25519_load_sk(cfg.auth_keydir, _sk64) == MPCP_OK ||
+                         mpcp_ed25519_load_pk(cfg.auth_keydir, _chk) == MPCP_OK);
+        sodium_memzero(_sk64, sizeof(_sk64));
+        bool has_peer = (mpcp_ed25519_load_peer_pk(cfg.auth_keydir, _chk) == MPCP_OK);
+        sodium_memzero(_chk, sizeof(_chk));
+
+        if (!has_sk) {
+            printf("  No keypair found in key directory.\n");
+            if (ask_yn("  Generate new keypair?", true)) {
+                if (mpcp_ed25519_keygen(cfg.auth_keydir) == MPCP_OK) {
+                    printf("  -> Keypair written. Share %smpcp_ed25519.pk\n",
+                           cfg.auth_keydir);
+                    printf("     with your peer — they save it as mpcp_ed25519_peer.pk\n");
+                    has_sk = true;
+                } else {
+                    mpcp_perror("ed25519 keygen", MPCP_ERR_CRYPTO);
+                }
+            }
+        } else {
+            printf("  Keypair: found\n");
         }
-    } else if (!is_sender) {
+
+        if (!has_peer) {
+            printf("  Peer public key: NOT FOUND\n");
+            printf("  -> Ed25519 mutual auth disabled for this session.\n");
+            printf("     Copy peer mpcp_ed25519.pk to %smpcp_ed25519_peer.pk\n",
+                   cfg.auth_keydir);
+            printf("     to enable it next time.\n");
+            cfg.auth_mode = MPCP_AUTH_PSK;
+        } else {
+            printf("  Peer public key: found\n");
+            if (g_ui_colour)
+                printf("  %s" GLYPH_OK " Ed25519 mutual auth enabled.%s\n", C_LIME, C_RESET);
+            else
+                printf("  Ed25519 mutual auth enabled.\n");
+        }
+        printf("\n");
+
+        /* Stealth calibration time warning for sender */
+        if (cfg.slow_mode && is_sender) {
+            uint32_t lo = cfg.ping_count_min * cfg.slow_mode_min_gap / 1000u;
+            uint32_t hi = cfg.ping_count_max * cfg.slow_mode_max_gap / 1000u;
+            if (g_ui_colour)
+                printf("  %s⚠ Stealth calibration takes ~%u–%u seconds (slow pings by design).%s\n",
+                       C_GOLD, lo, hi, C_RESET);
+            else
+                printf("  Note: stealth calibration takes ~%u-%u seconds.\n", lo, hi);
+        }
+    }
+
+    if (cfg.auth_mode != MPCP_AUTH_ED25519 && !is_sender) {
         /* RECEIVER: generates the PSK and shares it out-of-band with the sender.
          * The receiver owns the session - they create the secret, the sender enters it. */
         printf("  You are the receiver. Generate a PSK and share it with the sender\n");
@@ -10385,7 +10476,7 @@ static int run_transfer(void)
         memset(nonce_hint, 0, sizeof(nonce_hint));
 
         spinner_start(&sp, "  Reflecting pings");
-        int pong_rc = pong_server(&cfg, &sender_addr, nonce_hint);
+        int pong_rc = pong_server(&cfg, &sender_addr, nonce_hint, false);
         spinner_stop(&sp, pong_rc == 0);
         if (pong_rc != 0) {
             fw_cleanup();
@@ -10489,6 +10580,159 @@ static int run_transfer(void)
  * Main menu
  * ========================================================= */
 
+
+/* =========================================================
+ * Server / Listen mode  (menu option 5)
+ *
+ * Sits on port_base waiting for incoming senders.
+ * Each time a sender calibrates, prompts operator to accept/reject.
+ * If accepted, runs a full receive session then loops back to listen.
+ * ========================================================= */
+static int run_listen_once(void)
+{
+    banner("Listen mode");
+    if (g_ui_colour)
+        printf("  %sWaiting for an incoming sender. Press Ctrl-C to stop.%s\n",
+               C_GREY, C_RESET);
+    else
+        printf("  Waiting for incoming sender (Ctrl-C to stop)\n");
+
+    mpcp_config_t cfg;
+    mpcp_config_defaults(&cfg);
+    mpcp_profile_default(&cfg);
+    cfg.tripwire = false;   /* operator is watching; skip automated abort */
+
+    /* Ask for output directory */
+    char outdir[512] = {0};
+    read_line("  Save received files to directory: ", outdir, sizeof(outdir));
+    if (outdir[0] == '') snprintf(outdir, sizeof(outdir), "%s", getenv("HOME") ? getenv("HOME") : ".");
+
+    /* No PSK pre-set — sender will negotiate one */
+    printf("  Listening on port %u\n", cfg.port_base);
+    printf("  Files will be saved to: %s\n", outdir);
+
+    fw_maybe_open(cfg.port_base, cfg.port_range);
+
+    /* Show IPs */
+    {
+        struct ifaddrs *ifap, *ifa;
+        if (getifaddrs(&ifap) == 0) {
+            printf("  Your IP addresses:\n");
+            for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+                uint32_t ip = ntohl(sa->sin_addr.s_addr);
+                if ((ip >> 24) == 127 || (ip >> 16) == 0xA9FE) continue;
+                char ipstr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sa->sin_addr, ipstr, sizeof(ipstr));
+                if (g_ui_colour)
+                    printf("    %s%s%s  %s(%s)%s\n", C_PLUM, ipstr, C_RESET,
+                           C_GREY, ifa->ifa_name, C_RESET);
+                else
+                    printf("    %-16s  (%s)\n", ipstr, ifa->ifa_name);
+            }
+            freeifaddrs(ifap);
+        }
+    }
+
+    for (;;) {
+        struct sockaddr_in sender_addr;
+        memset(&sender_addr, 0, sizeof(sender_addr));
+        uint8_t nonce_hint[MPCP_SESSION_NONCE_LEN];
+        memset(nonce_hint, 0, sizeof(nonce_hint));
+
+        int pong_rc = pong_server(&cfg, &sender_addr, nonce_hint, true);
+        if (pong_rc == -2) {
+            /* Rejected — loop back and wait for next sender */
+            printf("  Listening again...\n");
+            continue;
+        }
+        if (pong_rc != 0) {
+            fprintf(stderr, "  error: calibration failed\n");
+            break;
+        }
+
+        char sender_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
+        printf("  Accepted sender: %s\n", sender_ip);
+
+        /* Enter PSK for this session */
+        banner("Authentication");
+        printf("  Enter the PSK the sender gives you:\n");
+        if (read_line("  PSK: ", cfg.psk, sizeof(cfg.psk)) != 0) break;
+        cfg.psk_len = strlen(cfg.psk);
+        if (mpcp_config_check_psk(&cfg) != MPCP_OK) {
+            mpcp_perror("PSK", MPCP_ERR_ENTROPY);
+            continue;
+        }
+
+        /* Build output path: outdir/sender_ip_timestamp.bin */
+        char out_path[768];
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        char ts[32];
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm);
+        snprintf(out_path, sizeof(out_path), "%s/%s_%s.bin", outdir, sender_ip, ts);
+        printf("  Saving to: %s\n", out_path);
+
+        /* Full session */
+        mpcp_session_t sess;
+        memset(&sess, 0, sizeof(sess));
+        memcpy(sess.session_nonce, nonce_hint, MPCP_SESSION_NONCE_LEN);
+
+        if (mpcp_derive_master_secret(sess.session_nonce, NULL, 0,
+                                       (const uint8_t *)cfg.psk, cfg.psk_len,
+                                       sess.master_secret) != MPCP_OK) {
+            mpcp_perror("master secret", MPCP_ERR_CRYPTO);
+            continue;
+        }
+
+        mpcp_candidates_t cands;
+        memset(&cands, 0, sizeof(cands));
+        banner("Key exchange");
+        spinner_t sp;
+        spinner_start(&sp, "  Exchanging keys");
+        int rc = mpcp_exchange_pc1(&cfg, &sess, &sender_addr, &cands);
+        spinner_stop(&sp, rc == MPCP_OK);
+        if (rc != MPCP_OK) { mpcp_perror("key exchange", rc); continue; }
+        printf("  Session key established.\n");
+
+        uint32_t n_chunks = 0;
+        uint8_t  xfer_flags = 0;
+        spinner_start(&sp, "  Awaiting transfer info");
+        rc = transfer_info_recv(&sess, &cfg, &n_chunks, &xfer_flags);
+        spinner_stop(&sp, rc == MPCP_OK);
+        if (rc != MPCP_OK) { mpcp_perror("transfer info", rc); continue; }
+        sess.skip_compression = (xfer_flags & MPCP_FLAG_SKIP_COMPRESSION) != 0;
+        printf("  Expecting %u chunks.\n", n_chunks);
+
+        banner("Receiving");
+        printf("  Expecting %u data chunks\n", n_chunks);
+        spinner_start(&sp, "  Receiving");
+        rc = mpcp_receiver_run(&cfg, &sess, &sender_addr, out_path, n_chunks);
+        spinner_stop(&sp, rc == MPCP_OK);
+        if (rc == MPCP_OK) {
+            if (g_ui_colour)
+                printf("  %s" GLYPH_OK " File saved: %s%s\n", C_LIME, out_path, C_RESET);
+            else
+                printf("  File saved: %s\n", out_path);
+        } else {
+            mpcp_perror("receive", rc);
+        }
+
+        sodium_memzero(&sess, sizeof(sess));
+        sodium_memzero(cfg.psk, sizeof(cfg.psk));
+        cfg.psk_len = 0;
+
+        printf("\n");
+        if (!ask_yn("  Wait for another sender?", true)) break;
+        printf("  Listening again...\n");
+    }
+
+    fw_cleanup();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--test") == 0)
@@ -10540,6 +10784,11 @@ int main(int argc, char **argv)
             printf("  2) Manage contacts\n");
             printf("  3) Run self-test (loopback)\n");
             printf("  4) Benchmark (loopback throughput)\n");
+            if (g_ui_colour)
+                printf("  %s5%s  %sâ¡%s  Listen / server mode\n",
+                       C_PLUM, C_RESET, C_GOLD, C_RESET);
+            else
+                printf("  5) Listen / server mode\n");
             printf("  q) Quit\n\n");
         }
 
@@ -10560,6 +10809,8 @@ int main(int argc, char **argv)
             run_selftest();
         } else if (buf[0] == '4') {
             run_bench();
+        } else if (buf[0] == '5') {
+            run_listen_once();
         } else if (buf[0] == 'q' || buf[0] == 'Q') {
             if (g_ui_colour)
                 printf("\n  %s" GLYPH_GEM " Bye.%s\n\n", C_VIOLET, C_RESET);
