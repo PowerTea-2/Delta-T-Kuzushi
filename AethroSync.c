@@ -30,6 +30,7 @@
 - ========================================================= */
   #include <termios.h>
   #include <time.h>
+  #include <sys/epoll.h>
   #include <arpa/inet.h>
   #include <ctype.h>
   #include <errno.h>
@@ -431,7 +432,17 @@ extern const char *mpcp_strerror(mpcp_err_t err);
   uint8_t *keystream;   /* total_chunks * MPCP_KEYSTREAM_SLOT bytes */
   uint32_t total_chunks;
   bool     skip_compression; /* received from transfer_info flags; tells receiver not to ZSTD_decompress */
+  bool     decoy_encoding;   /* S22: chunks wrapped as C header files */
+  uint8_t  file_sha256[32];  /* SHA256 of original file — sent by sender, verified by receiver */
+  void    *sender_progress;  /* mpcp_sender_progress_t* — set by CLI, read by sender_run */
+  uint32_t file_counter;     /* incremented per file; mixes into keystream to prevent nonce reuse */
   } mpcp_session_t;
+
+/* Sender live-progress hook: set before mpcp_sender_run, read from display thread */
+typedef struct {
+    _Atomic(uint32_t) *acks_received;
+    uint32_t           n_chunks;
+} mpcp_sender_progress_t;
 
 /* -------------------------
 
@@ -513,6 +524,7 @@ uint8_t    xchacha_nonce[24];
 } mpcp_chunk_hdr_t;
 
 #define MPCP_FLAG_SKIP_COMPRESSION  0x01
+#define MPCP_FLAG_DECOY_ENCODING    0x02   /* S22: transfer_info flag bit */
 #define MPCP_FLAG_LAST_CHUNK        0x02
 
 /* Compile-time wire format size assertions (catch struct layout regressions) */
@@ -1168,6 +1180,7 @@ mpcp_ring_slot_t *mpcp_ring_claim(mpcp_ring_t *r);      /* producer      */
 void              mpcp_ring_publish(mpcp_ring_t *r, mpcp_ring_slot_t *s);
 mpcp_ring_slot_t *mpcp_ring_consume(mpcp_ring_t *r);    /* consumer      */
 void              mpcp_ring_release(mpcp_ring_t *r, mpcp_ring_slot_t *s);
+void              mpcp_ring_release_plain(mpcp_ring_t *r, mpcp_ring_slot_t *s); /* no wipe */
 
 /* =========================================================================
 
@@ -4610,6 +4623,14 @@ return p_value;
 
 }
 
+/* FIX 5: minimum sample floors before chi-squared test.
+ * - min 10 loss events (TRIPWIRE_CHI_MIN_LOSSES)
+ * - min 50 total chunk space (TRIPWIRE_CHI_MIN_TOTAL_CHUNKS)
+ * - E_i >= 5 for all buckets requires n_losses >= 40 (K=8 buckets)
+ * Prevents false-positive aborts on small transfers. */
+#define TRIPWIRE_CHI_MIN_LOSSES        10u
+#define TRIPWIRE_CHI_MIN_TOTAL_CHUNKS  50u
+
 int mpcp_tripwire_record_loss(mpcp_tripwire_t *tw, uint32_t seq_index)
 {
 if (!tw || tw->triggered) return MPCP_ERR_TRIPWIRE;
@@ -4618,16 +4639,28 @@ if (tw->lost_count < 4096u) {
     tw->lost_indices[tw->lost_count++] = seq_index;
 }
 
+/* FIX 5a: need minimum loss events before test is meaningful */
+if (tw->lost_count < TRIPWIRE_CHI_MIN_LOSSES)
+    return MPCP_OK;
+
 /*
- * Only run the chi-squared test once we have enough data.
- * total_chunks is not stored in tripwire_t; approximate from
- * the maximum seen seq index.
+ * Approximate total chunk space from maximum observed seq index.
  */
 uint32_t max_seen = 0;
 for (uint32_t i = 0; i < tw->lost_count; i++) {
     if (tw->lost_indices[i] > max_seen) max_seen = tw->lost_indices[i];
 }
 uint32_t approx_total = max_seen + 1u;
+
+/* FIX 5b: need minimum chunk space for valid bucket distribution */
+if (approx_total < TRIPWIRE_CHI_MIN_TOTAL_CHUNKS)
+    return MPCP_OK;
+
+/* FIX 5c: chi-squared validity: E_i >= 5 for all K=8 buckets
+ * requires n_losses / 8 >= 5, i.e. n_losses >= 40. */
+double expected_per_bucket = (double)tw->lost_count / (double)CHI_BUCKETS;
+if (expected_per_bucket < 5.0)
+    return MPCP_OK;
 
 double pval = chi_squared_pvalue(tw->lost_indices, tw->lost_count,
                                  approx_total);
@@ -5161,6 +5194,22 @@ return MPCP_OK;
 - S9.2  Lock-free SPSC ring buffer
 - ====================================================================== */
 
+/* FIX 2: SCHED_FIFO-safe 1µs backoff.
+ * sched_yield() under SCHED_FIFO immediately re-schedules the calling
+ * thread if it is the highest-priority runnable task, causing a hard
+ * CPU spin-lock.  Use an absolute clock_nanosleep of 1µs instead. */
+static inline void pipeline_backoff_1us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_nsec += 1000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ts.tv_sec  += 1;
+    }
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+}
+
 int mpcp_ring_init(mpcp_ring_t *r, uint32_t depth, uint32_t chunk_pad_size)
 {
 if (!r || depth == 0 || chunk_pad_size == 0) return MPCP_ERR_PARAM;
@@ -5225,7 +5274,7 @@ r->slots = NULL;
   atomic_fetch_add_explicit(&r->head, 1u, memory_order_relaxed);
   return &r->slots[idx];
   }
-  sched_yield();
+  pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
   }
   }
 
@@ -5252,6 +5301,15 @@ void mpcp_ring_release(mpcp_ring_t *r, mpcp_ring_slot_t *s)
 {
 (void)r;
 sodium_memzero(s->buf, s->buf_capacity);
+atomic_store_explicit(&s->state, (int)MPCP_SLOT_EMPTY, memory_order_release);
+}
+
+/* Non-secure release: no wipe. Use for rings carrying plaintext file data
+ * (ring0 reader→compressor, ring1 compressor→crypto input) where the data
+ * is not sensitive key material. */
+void mpcp_ring_release_plain(mpcp_ring_t *r, mpcp_ring_slot_t *s)
+{
+(void)r;
 atomic_store_explicit(&s->state, (int)MPCP_SLOT_EMPTY, memory_order_release);
 }
 
@@ -5430,8 +5488,8 @@ for (uint32_t i = 0; i < ctx->plan.n_chunks; i++) {
     ssize_t n = read(ctx->file_fd, slot->buf, chunk_sz);
     if (n != (ssize_t)chunk_sz) {
         atomic_store_explicit(&ctx->abort_flag, true, memory_order_relaxed);
-        /* Release slot even on error */
-        mpcp_ring_release(&ctx->ring0, slot);
+        /* Release slot even on error - plain release, data not sensitive */
+        mpcp_ring_release_plain(&ctx->ring0, slot);
         break;
     }
     mpcp_ring_publish(&ctx->ring0, slot);
@@ -5461,7 +5519,7 @@ for (;;) {
             break;
         if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
             break;
-        sched_yield();
+        pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
         continue;
     }
 
@@ -5495,7 +5553,7 @@ for (;;) {
         }
     }
 
-    mpcp_ring_release(&ctx->ring0, in);
+    mpcp_ring_release_plain(&ctx->ring0, in); /* plain release: raw file data */
     mpcp_ring_publish(&ctx->ring1, out);
 
     /* Check for last chunk */
@@ -5525,7 +5583,7 @@ for (;;) {
             break;
         if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
             break;
-        sched_yield();
+        pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
         continue;
     }
 
@@ -5653,7 +5711,7 @@ while (data_consumed < ctx->plan.n_chunks) { /* exit when all DATA chunks sent; 
         break;
 
     mpcp_ring_slot_t *slot = mpcp_ring_consume(&ctx->ring2);
-    if (!slot) { sched_yield(); continue; }
+    if (!slot) { pipeline_backoff_1us(); continue; }  /* FIX 2 */
 
     uint32_t seq  = slot->seq_index;
     uint16_t port = chunk_port(ctx->sess, ctx->cfg, seq);
@@ -5991,21 +6049,40 @@ return NULL;
   ghost_seqs, &ghost_count);
   }
   
-  /* BUG-4 FIX: Ghost seq indices are n_data_chunks .. n_data_chunks+ghost_count-1.
-  - mpcp_keystream_slot(keystream, ghost_seq) reads at offset ghost_seq*64, which
-  - is past the end of a keystream sized for n_data_chunks only.
-  - Re-derive the keystream here to cover ALL sequences (data + ghost).
-  - The caller-supplied keystream is freed and replaced. */
+  /* FIX 3B + BUG-4 FIX: Re-derive keystream to cover data + ghost seq slots.
+   * Use HKDF with file-counter-specific info string for domain separation.
+   * salt = session_nonce, ikm = session_key, info = "mpcp-v0.5-keystream-file-XXXXXXXX"
+   * MUST match receiver derivation exactly. */
     uint32_t total_ks_chunks = plan.n_chunks + ghost_count;
     if (total_ks_chunks > 127u) { close(file_fd); return MPCP_ERR_PARAM; }
     if (sess->keystream) {
-    sodium_memzero(sess->keystream,
-    (size_t)(plan.n_chunks) * MPCP_KEYSTREAM_SLOT);
-    sodium_free(sess->keystream);
-    sess->keystream = NULL;
+        size_t old_ks_len = (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT;
+        if (old_ks_len == 0) old_ks_len = (size_t)total_ks_chunks * MPCP_KEYSTREAM_SLOT;
+        sodium_memzero(sess->keystream, old_ks_len);
+        sodium_free(sess->keystream);
+        sess->keystream = NULL;
     }
-    sess->keystream = mpcp_derive_keystream(sess->session_key, total_ks_chunks);
-    if (!sess->keystream) { close(file_fd); return MPCP_ERR_ALLOC; }
+    {
+        char ks_info[48];
+        snprintf(ks_info, sizeof(ks_info),
+                 "mpcp-v0.5-keystream-file-%08x",
+                 (unsigned)sess->file_counter);
+        size_t   ks_len = (size_t)total_ks_chunks * MPCP_KEYSTREAM_SLOT;
+        uint8_t *ks_out = sodium_malloc(ks_len);
+        if (!ks_out) { close(file_fd); return MPCP_ERR_ALLOC; }
+        if (mpcp_hkdf(sess->session_nonce, MPCP_SESSION_NONCE_LEN,
+                      sess->session_key,   MPCP_SESSION_KEY_LEN,
+                      ks_info,
+                      ks_out, ks_len) != MPCP_OK) {
+            sodium_free(ks_out);
+            sodium_memzero(ks_info, sizeof(ks_info));
+            close(file_fd);
+            return MPCP_ERR_CRYPTO;
+        }
+        sess->keystream      = ks_out;
+        sess->total_chunks   = total_ks_chunks;
+        sodium_memzero(ks_info, sizeof(ks_info));
+    }
   
   /* - Init context - */
   mpcp_sender_ctx_t ctx;
@@ -6040,6 +6117,14 @@ return NULL;
       free(ctx.retry_cache); free(ctx.retry_cache_lens);
       free(ctx.retry_nonces); free(ctx.retry_data_lens);
       free(ctx.retry_flags); free(ctx.sent_flag); free(ctx.sent_time_ns);
+      /* FIX 7: free keystream on all error paths */
+      if (sess->keystream) {
+          sodium_memzero(sess->keystream,
+                         (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT);
+          sodium_free(sess->keystream);
+          sess->keystream    = NULL;
+          sess->total_chunks = 0;
+      }
       close(file_fd); return MPCP_ERR_ALLOC;
   }
   
@@ -6055,19 +6140,26 @@ return NULL;
     if ((rc = mpcp_ring_init(&ctx.ring2, cfg->ring_depth, cfg->chunk_pad_size + 16u)) != MPCP_OK)
     goto cleanup_ring1;
   
-  /* ACK socket — also used as the persistent send socket so that ACK
-   * replies from the receiver reach this same fd (source port matches). */
+  /* FIX 4: ACK/send socket binds to INADDR_ANY:0 (OS-assigned ephemeral).
+   * The sender MUST NOT bind to chunk_port[i] — those ports belong exclusively
+   * to the receiver. The receiver owns chunk_port and binds them for listening.
+   * By binding to port 0 here, all chunk sends use one stable ephemeral source
+   * port so receiver ACKs return to this fd unambiguously. */
   int ack_sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (ack_sock < 0) { rc = MPCP_ERR_IO; goto cleanup_ring2; }
-  /* Bind to INADDR_ANY:0 so OS assigns a stable ephemeral port. All chunk
-   * sends use this socket, so receiver ACKs come back here. */
   {
+      int sndbuf = 4 * 1024 * 1024;
+      setsockopt(ack_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
       struct sockaddr_in ack_bind;
       memset(&ack_bind, 0, sizeof(ack_bind));
       ack_bind.sin_family      = AF_INET;
       ack_bind.sin_addr.s_addr = INADDR_ANY;
-      ack_bind.sin_port        = 0; /* OS picks ephemeral port */
-      (void)bind(ack_sock, (struct sockaddr *)&ack_bind, sizeof(ack_bind));
+      ack_bind.sin_port        = 0;  /* FIX 4: ephemeral — NOT chunk_port */
+      if (bind(ack_sock, (struct sockaddr *)&ack_bind, sizeof(ack_bind)) < 0) {
+          /* Non-fatal: unbound socket still works; OS picks port on first send */
+          fprintf(stderr, "[sender] ack_sock bind: %s (continuing)\n",
+                  strerror(errno));
+      }
   }
   
   /* - Launch threads - */
@@ -6101,9 +6193,16 @@ return NULL;
   else
   rc = MPCP_OK;
   
-  /* S11 Silent termination - zero session key and master secret */
-  sodium_memzero(sess->session_key,    MPCP_SESSION_KEY_LEN);
-  sodium_memzero(sess->master_secret,  MPCP_MASTER_SECRET_LEN);
+  /* S11: Wipe per-file keystream only.
+   * FIX 1: session_key and master_secret persist for multi-file sessions.
+   * CLI teardown (run_transfer) wipes them after all files complete. */
+  if (sess->keystream) {
+      sodium_memzero(sess->keystream,
+                     (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT);
+      sodium_free(sess->keystream);
+      sess->keystream    = NULL;
+      sess->total_chunks = 0;
+  }
 
   /* Free retry cache */
   if (ctx.retry_cache) {
@@ -6338,7 +6437,7 @@ for (;;) {
         /* Exit only after T1 finished and ring0 is drained */
         if (atomic_load_explicit(&ctx->t1_done, memory_order_acquire)) break;
         if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
-        sched_yield();
+        pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
         continue;
     }
 
@@ -6397,7 +6496,7 @@ for (;;) {
         /* Exit only after T2 finished and ring1 is drained */
         if (atomic_load_explicit(&ctx->t2_done, memory_order_acquire)) break;
         if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
-        sched_yield();
+        pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
         continue;
     }
 
@@ -6487,7 +6586,7 @@ for (;;) {
             break;
         if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed))
             break;
-        sched_yield();
+        pipeline_backoff_1us();   /* FIX 2: safe under SCHED_FIFO */
         continue;
     }
 
@@ -6571,16 +6670,37 @@ return NULL;
   
   uint32_t total_chunks = n_chunks + ghost_count;
   
-  /* BUG-4 FIX: same as sender - re-derive keystream to cover ghost seqs. */
+  /* FIX 3B + BUG-4 FIX: Re-derive keystream covering data + ghost seqs.
+   * Use HKDF with file-counter-specific info string — MUST match sender. */
   if (total_chunks > 127u) { close(out_fd); return MPCP_ERR_PARAM; }
   if (sess->keystream) {
-  sodium_memzero(sess->keystream,
-  (size_t)n_chunks * MPCP_KEYSTREAM_SLOT);
-  sodium_free(sess->keystream);
-  sess->keystream = NULL;
+      size_t old_ks_len2 = (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT;
+      if (old_ks_len2 == 0) old_ks_len2 = (size_t)total_chunks * MPCP_KEYSTREAM_SLOT;
+      sodium_memzero(sess->keystream, old_ks_len2);
+      sodium_free(sess->keystream);
+      sess->keystream = NULL;
   }
-  sess->keystream = mpcp_derive_keystream(sess->session_key, total_chunks);
-  if (!sess->keystream) { close(out_fd); return MPCP_ERR_ALLOC; }
+  {
+      char ks_info2[48];
+      snprintf(ks_info2, sizeof(ks_info2),
+               "mpcp-v0.5-keystream-file-%08x",
+               (unsigned)sess->file_counter);
+      size_t   ks_len2 = (size_t)total_chunks * MPCP_KEYSTREAM_SLOT;
+      uint8_t *ks_out2 = sodium_malloc(ks_len2);
+      if (!ks_out2) { close(out_fd); return MPCP_ERR_ALLOC; }
+      if (mpcp_hkdf(sess->session_nonce, MPCP_SESSION_NONCE_LEN,
+                    sess->session_key,   MPCP_SESSION_KEY_LEN,
+                    ks_info2,
+                    ks_out2, ks_len2) != MPCP_OK) {
+          sodium_free(ks_out2);
+          sodium_memzero(ks_info2, sizeof(ks_info2));
+          close(out_fd);
+          return MPCP_ERR_CRYPTO;
+      }
+      sess->keystream    = ks_out2;
+      sess->total_chunks = total_chunks;
+      sodium_memzero(ks_info2, sizeof(ks_info2));
+  }
   
   /* Pre-compute ports for all chunk sequences */
   uint16_t *ports = malloc(total_chunks * sizeof(uint16_t));
@@ -6595,6 +6715,14 @@ return NULL;
   bool      *chunk_ready = calloc(n_chunks, sizeof(bool));
   if (!chunk_store || !chunk_lens || !chunk_ready) {
   free(ports); free(chunk_store); free(chunk_lens); free(chunk_ready);
+  /* FIX 7: free keystream on all error paths */
+  if (sess->keystream) {
+      sodium_memzero(sess->keystream,
+                     (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT);
+      sodium_free(sess->keystream);
+      sess->keystream    = NULL;
+      sess->total_chunks = 0;
+  }
   close(out_fd);
   return MPCP_ERR_ALLOC;
   }
@@ -6698,9 +6826,16 @@ return NULL;
     resume_clear(out_path);  /* delete sidecar on success */
   }
 
-  /* S11 Silent termination - zero key material */
-  sodium_memzero(sess->session_key,   MPCP_SESSION_KEY_LEN);
-  sodium_memzero(sess->master_secret, MPCP_MASTER_SECRET_LEN);
+  /* S11: Wipe per-file keystream only.
+   * FIX 1: session_key and master_secret persist for multi-file sessions.
+   * CLI teardown wipes them after all files complete. */
+  if (sess->keystream) {
+      sodium_memzero(sess->keystream,
+                     (size_t)sess->total_chunks * MPCP_KEYSTREAM_SLOT);
+      sodium_free(sess->keystream);
+      sess->keystream    = NULL;
+      sess->total_chunks = 0;
+  }
   
   mpcp_ring_destroy(&ctx.ring2);
   cleanup_r1:
@@ -8356,15 +8491,17 @@ sess->keystream = NULL;
   mpcp_tripwire_init(&tw, &rtt, &cfg);
   
   /* Simulate selective loss: first plant a loss at index 199 to establish
-   * approx_total=200 (bucket_size=25), then cluster 19 more losses at
-   * indices 0-18. Bucket 0 gets 19 hits, bucket 7 gets 1, rest get 0.
-   * Expected per bucket = 20/8 = 2.5, chi2 >> critical value -> p < 0.05. */
+   * approx_total=200 (bucket_size=25), then cluster 40 more losses at
+   * indices 0-39. Bucket 0 gets 40 hits (indices 0-24), bucket 1 gets 16
+   * hits (indices 25-39), bucket 7 gets 1 hit (index 199), rest 0.
+   * With n=41 losses, expected_per_bucket = 41/8 = 5.125 >= 5.0 (FIX 5c OK).
+   * Chi2 >> critical value for df=7 -> p << 0.05 triggers abort. */
   bool triggered = false;
   /* Anchor the total space at 200 chunks */
   if (mpcp_tripwire_record_loss(&tw, 199) == MPCP_ERR_TRIPWIRE)
       triggered = true;
-  /* Now cluster losses at the low end */
-  for (uint32_t i = 0; i < 19 && !triggered; i++) {
+  /* Now cluster 40 losses at the low end to saturate bucket 0 & 1 */
+  for (uint32_t i = 0; i < 40 && !triggered; i++) {
   if (mpcp_tripwire_record_loss(&tw, i) == MPCP_ERR_TRIPWIRE) {
   triggered = true;
   }
@@ -9353,6 +9490,9 @@ static uint16_t xfer_info_port(const mpcp_session_t *sess,
 }
 
 /* Sender: encrypt and send n_chunks + flags to receiver */
+/* FIX 3A: transfer_info_send uses a fresh random nonce per call.
+ * Wire format: nonce(24) || ciphertext(21) = 45 bytes total.
+ * Plaintext: n_chunks(4 BE) | flags(1) = 5 bytes → CT = 5+16 = 21 bytes. */
 static int transfer_info_send(const mpcp_session_t *sess,
                                const mpcp_config_t  *cfg,
                                const struct sockaddr_in *peer_addr,
@@ -9367,9 +9507,9 @@ static int transfer_info_send(const mpcp_session_t *sess,
     plain[3] = (uint8_t)( n_chunks        & 0xFF);
     plain[4] = flags;
 
-    /* Nonce: first 24 bytes of session_key (safe - key is 32B) */
+    /* FIX 3A: fresh random nonce — never reuse session_key bytes as nonce */
     uint8_t nonce[24];
-    memcpy(nonce, sess->session_key, 24);
+    randombytes_buf(nonce, sizeof(nonce));
 
     /* Ciphertext: 5 + 16 (poly tag) = 21 bytes */
     uint8_t ct[21];
@@ -9378,8 +9518,20 @@ static int transfer_info_send(const mpcp_session_t *sess,
             ct, &ct_len,
             plain, sizeof(plain),
             NULL, 0,
-            NULL, nonce, sess->session_key) != 0)
+            NULL, nonce, sess->session_key) != 0) {
+        sodium_memzero(plain, sizeof(plain));
+        sodium_memzero(nonce, sizeof(nonce));
         return MPCP_ERR_CRYPTO;
+    }
+
+    /* Wire format: nonce(24) || ciphertext(21) = 45 bytes */
+    uint8_t wire[45];
+    memcpy(wire,      nonce, 24);
+    memcpy(wire + 24, ct,    (size_t)ct_len);
+    size_t wire_len = 24u + (size_t)ct_len;
+
+    sodium_memzero(plain, sizeof(plain));
+    sodium_memzero(nonce, sizeof(nonce));
 
     uint16_t port = xfer_info_port(sess, cfg);
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -9390,7 +9542,7 @@ static int transfer_info_send(const mpcp_session_t *sess,
 
     /* Retry a few times in case receiver isn't ready yet */
     for (int i = 0; i < 5; i++) {
-        sendto(sock, ct, (size_t)ct_len, 0,
+        sendto(sock, wire, wire_len, 0,
                (struct sockaddr *)&dst, sizeof(dst));
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L }; /* 200ms */
         nanosleep(&ts, NULL);
@@ -9399,7 +9551,9 @@ static int transfer_info_send(const mpcp_session_t *sess,
     return MPCP_OK;
 }
 
-/* Receiver: wait for and decrypt transfer info from sender */
+/* FIX 3A: transfer_info_recv — new wire format only.
+ * Wire format: nonce(24) || ciphertext(21) = 45 bytes.
+ * Any other size returns MPCP_ERR_PROTO (old format removed). */
 static int transfer_info_recv(const mpcp_session_t *sess,
                                const mpcp_config_t  *cfg,
                                uint32_t *n_chunks_out,
@@ -9427,24 +9581,30 @@ static int transfer_info_recv(const mpcp_session_t *sess,
     struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    uint8_t ct[32]; /* 21 bytes expected + slack */
-    ssize_t n = recv(fd, ct, sizeof(ct), 0);
+    /* Expect exactly 45 bytes: nonce(24) || ct(21) */
+    uint8_t wire[48];
+    ssize_t n = recv(fd, wire, sizeof(wire), 0);
     close(fd);
 
-    if (n != 21) return MPCP_ERR_TIMEOUT;
+    if (n != 45) {
+        /* FIX 3A: reject all non-new-format packets */
+        return (n < 0) ? MPCP_ERR_TIMEOUT : MPCP_ERR_PROTO;
+    }
 
     uint8_t nonce[24];
-    memcpy(nonce, sess->session_key, 24);
+    memcpy(nonce, wire, 24);       /* first 24 bytes = random nonce */
+    uint8_t *ct_ptr = wire + 24;   /* remaining 21 bytes = ciphertext */
 
     uint8_t plain[5];
     unsigned long long pt_len = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+    int dec_rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
             plain, &pt_len,
             NULL,
-            ct, (unsigned long long)n,
+            ct_ptr, 21,
             NULL, 0,
-            nonce, sess->session_key) != 0)
-        return MPCP_ERR_CRYPTO;
+            nonce, sess->session_key);
+    sodium_memzero(nonce, sizeof(nonce));
+    if (dec_rc != 0) return MPCP_ERR_CRYPTO;
 
     if (pt_len != 5) return MPCP_ERR_PROTO;
 
@@ -9453,6 +9613,7 @@ static int transfer_info_recv(const mpcp_session_t *sess,
                     ((uint32_t)plain[2] <<  8) |
                      (uint32_t)plain[3];
     *flags_out    = plain[4];
+    sodium_memzero(plain, sizeof(plain));
 
     return MPCP_OK;
 }
@@ -10410,8 +10571,13 @@ static int run_transfer(void)
         spinner_start(&sp, "  Transferring");
         rc = mpcp_sender_run(&cfg, &sess, &peer_addr, file_buf);
         spinner_stop(&sp, rc == MPCP_OK);
-        if (rc == MPCP_OK) printf("  Transfer complete.\n");
-        else mpcp_perror("send", rc);
+        if (rc == MPCP_OK) {
+            printf("  Transfer complete.\n");
+            /* FIX 6: increment file_counter after each successful send */
+            sess.file_counter++;
+        } else {
+            mpcp_perror("send", rc);
+        }
 
     } else {
         /* =================================================================
@@ -10553,7 +10719,7 @@ static int run_transfer(void)
          * ZSTD_decompress raw bytes (e.g. JPEG, PNG, already-compressed files). */
         sess.skip_compression = (xfer_flags & MPCP_FLAG_SKIP_COMPRESSION) != 0;
 
-        /* Step 4: Receive with live progress bar */
+        /* Step 4: Receive file */
         banner("Receiving");
         {
             uint32_t recv_n = n_chunks;
@@ -10565,12 +10731,27 @@ static int run_transfer(void)
         if (rc == MPCP_OK) {
             printf("  File saved to: %s\n", file_buf);
             resume_clear(file_buf);  /* belt-and-suspenders */
+            /* FIX 6: increment file_counter after each successful receive */
+            sess.file_counter++;
         } else {
             mpcp_perror("receive", rc);
         }
     }
 
-    sodium_memzero(&sess, sizeof(sess));
+    /* FIX 1 + FIX 6: Final session teardown — wipe key material HERE,
+     * after all files on this session are complete. */
+    sodium_memzero(sess.session_key,   MPCP_SESSION_KEY_LEN);
+    sodium_memzero(sess.master_secret, MPCP_MASTER_SECRET_LEN);
+    sodium_memzero(sess.session_nonce, MPCP_SESSION_NONCE_LEN);
+    sodium_memzero(sess.file_sha256,   sizeof(sess.file_sha256));
+    if (sess.keystream) {
+        sodium_memzero(sess.keystream,
+                       (size_t)sess.total_chunks * MPCP_KEYSTREAM_SLOT);
+        sodium_free(sess.keystream);
+        sess.keystream    = NULL;
+        sess.total_chunks = 0;
+    }
+    sodium_memzero(&sess, sizeof(sess));   /* belt-and-suspenders */
     sodium_memzero(cfg.psk, sizeof(cfg.psk));
     fw_cleanup();  /* close any firewall rules opened for this session */
     return (rc == MPCP_OK) ? 0 : 1;
@@ -10605,7 +10786,7 @@ static int run_listen_once(void)
     /* Ask for output directory */
     char outdir[512] = {0};
     read_line("  Save received files to directory: ", outdir, sizeof(outdir));
-    if (outdir[0] == '') snprintf(outdir, sizeof(outdir), "%s", getenv("HOME") ? getenv("HOME") : ".");
+    if (outdir[0] == '\0') snprintf(outdir, sizeof(outdir), "%s", getenv("HOME") ? getenv("HOME") : ".");
 
     /* No PSK pre-set — sender will negotiate one */
     printf("  Listening on port %u\n", cfg.port_base);
@@ -10716,10 +10897,22 @@ static int run_listen_once(void)
                 printf("  %s" GLYPH_OK " File saved: %s%s\n", C_LIME, out_path, C_RESET);
             else
                 printf("  File saved: %s\n", out_path);
+            /* FIX 6: increment file_counter for multi-file sessions */
+            sess.file_counter++;
         } else {
             mpcp_perror("receive", rc);
         }
 
+        /* FIX 1: wipe session key material after each listen session completes */
+        sodium_memzero(sess.session_key,   MPCP_SESSION_KEY_LEN);
+        sodium_memzero(sess.master_secret, MPCP_MASTER_SECRET_LEN);
+        if (sess.keystream) {
+            sodium_memzero(sess.keystream,
+                           (size_t)sess.total_chunks * MPCP_KEYSTREAM_SLOT);
+            sodium_free(sess.keystream);
+            sess.keystream    = NULL;
+            sess.total_chunks = 0;
+        }
         sodium_memzero(&sess, sizeof(sess));
         sodium_memzero(cfg.psk, sizeof(cfg.psk));
         cfg.psk_len = 0;
