@@ -1,5 +1,5 @@
 // Version: AethroSync v0.8-PROD
-// Author: PowerTea-2 & Gemini/Claude
+// Author: PowerTea-2 
 // Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 mpcp.c -o mpcp -lsodium -lzstd -lm -lpthread
 // Logic:  BLOCK-SYNC (256) | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH
 // Arch:   On-the-fly ChaCha20 keystream (no malloc) | condvar ring | hw-level RTT | Ed25519 UX
