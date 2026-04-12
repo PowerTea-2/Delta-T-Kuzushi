@@ -1,255 +1,143 @@
-# ClockWork
+<div align="center">
 
-```text
-        .-===========-.
-        |  CLOCKWORK  |
-        |   00:00:00  |
-        '-===========-'
+# ⚙ ClockWork ⚙
+### ⋆⁺₊⋆ Gearbound synchronization for MPCP ⋆⁺₊⋆
 
-        ⚙      ⚙      ⚙
-     ⚙     ⚙      ⚙     ⚙
-        ⚙      ⚙      ⚙
-```
+<sub><em>crafted in starlight, wound by precision, and built to keep time</em></sub>
 
-A file transfer system that does not rely on connection — only agreement.
+<br>
 
----
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-5a6cff.svg?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
 
-## What it is
+<br>
 
-ClockWork is a file transfer application built on top of the **MPCP (Multi-Port Catch Protocol)**.
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ P R O J E C T I D E N T I T Y ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-It does not stream data over a stable connection.
-It schedules it.
+**Protocol** · MPCP  
+**Project** · ClockWork  
+**Maintainer** · PowerTea-2
 
-Both sides independently follow the same:
+⚙═════════════════════◈═════════════════════⚙
 
-* timing windows
-* port sequence
-* cryptographic schedule
+</div>
 
-The file emerges from alignment, not continuity.
+## ✨ Overview
 
----
+ClockWork is the tooling and reference implementation built around **MPCP** — the **Multi-Port Catch Protocol**.
 
-## Mechanical Model
+It is engineered for:
 
-```text
-        [ SENDER ]
-             ⚙
-      (chunk → encrypt)
-             ⚙
-      (time-slot emit)
-             ⚙
-        ports rotate
-   4102 → 5931 → 7773 → ...
-             ⚙
-             ▼
+- **Z-score timing windows** and real-time event correlation
+- **XChaCha20-Poly1305 + HKDF** key derivation from shared nonce + PSK
+- **Dynamic port-hopping** with ghost chunks for traffic blending
+- **Tripwire detection** using z-score and χ² loss-pattern analysis
+- **Zero-copy pipeline** with `SCHED_FIFO` timing thread
 
-        [ RECEIVER ]
-             ⚙
-      (multi-port intake)
-             ⚙
-      (time alignment)
-             ⚙
-      (reassembly engine)
-             ⚙
-           FILE
-```
+> *A system wound tight enough to hold a signal, and quiet enough to keep it hidden.*
 
-Each gear is independent.
-Nothing “holds” the connection together.
+<br>
 
----
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ M P C P & C l o c k W o r k ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-## Core Behaviors (from code)
+**MPCP** is the protocol.  
+**ClockWork** is the software built around it.
 
-### Time is the transport
+- MPCP defines the timing, transport, and cryptographic structure
+- ClockWork provides the implementation and user-facing tooling
 
-```text
-send(packet, t = exact)
-receive(window = computed)
-```
+This keeps the protocol specification separate from the application that uses it.
 
-* nanosecond clocks (`clock_gettime`)
-* calibrated RTT using trimmed mean + MAD + EWMA
-* adaptive catch window per session
+<br>
 
-The network is noisy.
-ClockWork models the noise, then moves through it.
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ I N S T A L L A T I O N ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
----
+<details>
+<summary><b>✨ Nix (fully reproducible)</b></summary>
 
-### Multi-port sequencing
+    nix-shell -p libsodium libzstd gcc gnumake --run "bash"
 
-```text
-chunk[i] → port = f(session_key, i)
-```
+</details>
 
-* ports derived from HKDF keystream
-* wide port range (default ~55k span)
-* no fixed channel
+<details>
+<summary><b>🐧 Debian / Ubuntu</b></summary>
 
-Packets do not form a stream.
-They scatter and are re-collected.
+    sudo apt install libsodium-dev libzstd-dev
 
----
+</details>
 
-### Encrypted chunk engine
+<details>
+<summary><b>🎩 Fedora / RHEL</b></summary>
 
-```text
-plaintext → pad → encrypt → emit
-```
+    sudo dnf install libsodium-devel libzstd-dev
 
-* XChaCha20-Poly1305 per chunk
-* unique nonce per emission
-* fixed-size padded chunks (traffic shaping)
+</details>
 
-All chunks look the same.
-Real and fake are indistinguishable.
+<details>
+<summary><b>🏹 Arch Linux</b></summary>
 
----
+    sudo pacman -S libsodium zstd
 
-### Ghost traffic
+</details>
 
-```text
-real:   [data]
-ghost:  [indistinguishable noise]
-```
+<details>
+<summary><b>🍎 macOS</b></summary>
 
-* deterministic ghost map from session key
-* injected into stream as valid ciphertext
-* receiver discards via schedule knowledge
+    brew install libsodium zstd
 
-Noise is not decoration.
-It is structural.
+</details>
 
----
+<br>
 
-### No connection state
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ B U I L D ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-```text
-(no TCP)
-(no stream)
-(no session socket)
-```
+    gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
+        clockwork.c -o clockwork -lsodium -lzstd -lm -lpthread
 
-* UDP / raw send
-* no handshake persistence
-* no teardown signal
+If your source filename is different, adjust the first line accordingly.
 
-Start → operate → disappear
+<br>
 
----
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ L E G A L ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-### Tripwire system
+Licensed under the **GNU Affero General Public License v3.0**.
 
-```text
-anomaly → zero keys → exit(0)
-```
+**Moral Rights** asserted by PowerTea-2 under EU copyright law.
 
-* z-score RTT anomaly detection
-* loss-pattern analysis (chi-squared)
-* silent abort + canary log
+Any derivative must:
 
-Failure is not reported.
-It is erased.
+- clearly mark itself as a fork
+- preserve the **Founding Architect** credit in all UI elements
+- label deviations from the MPCP spec as **Unverified Implementation**
 
----
+See `NOTICE` and `LICENSE` for full terms.
 
-### Pipeline architecture
+<br>
 
-```text
-[read] → [compress] → [encrypt] → [send]
-```
+⚙═════════════════════◈═════════════════════⚙  
+⋆⋆⋆ D O C U M E N T A T I O N ⋆⋆⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-* lock-free ring buffers
-* multi-threaded stages
-* optional zero-copy + batched syscalls
+- **Full Protocol Spec** — `MPCP_v0.5_FINAL_PowerTea-2.pdf`
+- **Legal Notice** — `NOTICE`
+- **Security Note** — research + educational use only
+- **Warranty** — none
 
-Work flows forward continuously.
-No stage waits longer than needed.
+<br>
 
----
+<div align="center">
 
-### Key system
+⚙═════════════════════◈═════════════════════⚙  
+⋆⁺₊⋆ c a r v e d i n s t a r l i g h t ⋆⁺₊⋆  
+⚙═════════════════════◈═════════════════════⚙
 
-```text
-N candidate keys → blind selection → 1 survives
-```
-
-* parallel key candidates
-* constant-time selection (receiver side)
-* all unused keys wiped immediately
-
-Only one path becomes real.
-
----
-
-## Visualization: timing-driven transfer
-
-```text
-Time ─────────────────────────────────▶
-
-Sender:    [pkt]     [pkt]      [pkt]
-              │         │          │
-              ▼         ▼          ▼
-Ports:     4102      5931       7773
-              │         │          │
-              ▼         ▼          ▼
-Receiver:  [buf]     [buf]      [buf]
-
-Reconstruction:
-   t0 → t1 → t2 → reorder → file
-```
-
-No continuous stream.
-Only correct arrival within time windows.
-
----
-
-## Build
-
-```bash
-gcc -std=c11 -D_GNU_SOURCE -O2 ClockWork.c -o clockwork -lsodium -lzstd -lm -lpthread
-```
-
----
-
-## Run
-
-```bash
-./clockwork
-./clockwork --test
-./clockwork --selftest
-./clockwork --bench
-./clockwork -v
-```
-
----
-
-## Design Summary
-
-ClockWork behaves like a machine:
-
-* timing is the drive shaft
-* ports are rotating gears
-* chunks are teeth
-* the receiver is the assembly stage
-
-Nothing is continuous.
-Everything is coordinated.
-
----
-
-## Spec
-
-```text
-ClockWork_v0.5_FINAL_PowerTea-2.pdf
-```
-
----
-
-## License
-
-<define here>
+</div>
