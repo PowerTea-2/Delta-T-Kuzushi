@@ -226,6 +226,7 @@ extern const char *mpcp_strerror(mpcp_err_t err);
 #define MPCP_TYPE_GHOST_CHUNK    0x05
 #define MPCP_TYPE_ACK            0x06
 #define MPCP_TYPE_BOUNCE         0x07
+#define MPCP_SIG_READY           0x7E
 typedef enum {
 MPCP_AUTH_PSK    = 0,
 MPCP_AUTH_ED25519 = 1,
@@ -303,6 +304,9 @@ uint32_t file_counter;
 int64_t  clock_offset_ns;  
 uint64_t blink_interval_ns;
 uint64_t blink_origin_ns;  
+uint64_t t_zero_ns;
+double   drift_coefficient;
+
 } mpcp_session_t;
 typedef struct {
 _Atomic(uint32_t) *acks_received;
@@ -319,6 +323,19 @@ double baseline_mean;
 double baseline_std;  
 uint32_t sample_count;
 } mpcp_rtt_result_t;
+
+typedef struct {
+double   stable_mean_rtt_ms;
+double   jitter_variance_ms2;
+double   drift_ppm;
+double   drift_coefficient;
+uint64_t blink_interval_ns;
+uint64_t tzero_ns;
+uint16_t ghost_port;
+uint32_t samples_sent;
+uint32_t samples_kept;
+bool     handshake_locked;
+} mpcp_calib_t;
 
 /* ---------------------------------------------------------------------------
  * q32_t  —  signed Q16.16 fixed-point scalar (FPU-free Kalman arithmetic)
@@ -593,6 +610,20 @@ ts.tv_sec  = (time_t)(target_ns / 1000000000ULL);
 ts.tv_nsec = (long)(target_ns % 1000000000ULL);
 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
+static inline void mpcp_precise_wait_ns(uint64_t target_ns, uint64_t busy_wait_ns)
+{
+uint64_t now = mpcp_now_ns();
+if (target_ns > now + busy_wait_ns) {
+uint64_t sleep_until = target_ns - busy_wait_ns;
+struct timespec ts;
+ts.tv_sec  = (time_t)(sleep_until / 1000000000ULL);
+ts.tv_nsec = (long)(sleep_until % 1000000000ULL);
+(void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+}
+while ((now = mpcp_now_ns()) < target_ns) {
+__asm__ __volatile__("pause" ::: "memory");
+}
+}
 int mpcp_crypto_init(void);
 int mpcp_hkdf(const uint8_t *salt,  size_t salt_len,
 const uint8_t *ikm,   size_t ikm_len,
@@ -666,7 +697,8 @@ void mpcp_config_dump(const mpcp_config_t *cfg, FILE *out);
 int mpcp_calibrate(const mpcp_config_t     *cfg,
 const mpcp_session_t    *sess,
 const struct sockaddr_in *peer_addr,
-mpcp_rtt_result_t       *result_out);
+mpcp_rtt_result_t       *result_out,
+mpcp_calib_t            *calib_out);
 int mpcp_calibrate_collect_samples(const mpcp_config_t     *cfg,
 const mpcp_session_t    *sess,
 const struct sockaddr_in *peer,
@@ -916,6 +948,7 @@ uint32_t                   n_chunks);
 static uint16_t blink_hop_port(const mpcp_session_t *sess,
 const mpcp_config_t  *cfg,
 uint32_t              chunk_idx);
+static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq);
 static uint64_t blink_arrival_time(const mpcp_session_t *sess,
 uint32_t              chunk_idx);
 static ssize_t blink_recv_window(int fd, void *buf, size_t buf_len,
@@ -2111,66 +2144,263 @@ core_id, core_id, core_id, core_id);
 }
 return MPCP_OK;
 }
+static inline uint64_t mpcp_now_raw_ns(void)
+{
+struct timespec ts;
+clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static double percentile_sorted(const double *sorted, size_t n, double p)
+{
+if (n == 0) return 0.0;
+if (p <= 0.0) return sorted[0];
+if (p >= 1.0) return sorted[n - 1];
+double idx = p * (double)(n - 1);
+size_t lo = (size_t)idx;
+size_t hi = (lo + 1 < n) ? lo + 1 : lo;
+double frac = idx - (double)lo;
+return sorted[lo] + frac * (sorted[hi] - sorted[lo]);
+}
+
+static void insertion_sort_double(double *a, size_t n)
+{
+for (size_t i = 1; i < n; i++) {
+double key = a[i];
+ssize_t j = (ssize_t)i - 1;
+while (j >= 0 && a[j] > key) {
+a[j + 1] = a[j];
+j--;
+}
+a[j + 1] = key;
+}
+}
+
+static int cal_ping_once_raw(int sock,
+const mpcp_config_t *cfg,
+const struct sockaddr_in *peer,
+const uint8_t session_nonce[MPCP_SESSION_NONCE_LEN],
+uint16_t seq,
+double *rtt_ms_out,
+uint64_t *t_send_raw_out,
+uint64_t *t_recv_raw_out)
+{
+mpcp_cal_pkt_t ping;
+build_ping(&ping, seq, session_nonce);
+uint8_t wire[MPCP_CAL_WIRE_BUF];
+size_t wire_len = sizeof(ping);
+if (cfg->disguise_calibration) {
+wire_len = mpcp_disguise_wrap((const uint8_t *)&ping, sizeof(ping),
+wire, sizeof(wire), cfg->disguise_protocol);
+if (wire_len == 0) return MPCP_ERR_PROTO;
+} else {
+memcpy(wire, &ping, sizeof(ping));
+}
+uint64_t t0 = mpcp_now_raw_ns();
+if (sendto(sock, wire, wire_len, 0, (const struct sockaddr *)peer, sizeof(*peer)) < 0)
+return MPCP_ERR_IO;
+uint8_t rx[MPCP_CAL_WIRE_BUF];
+struct sockaddr_in from;
+socklen_t fromlen = sizeof(from);
+ssize_t n = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+uint64_t t1 = mpcp_now_raw_ns();
+if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? MPCP_ERR_TIMEOUT : MPCP_ERR_IO;
+if (from.sin_addr.s_addr != peer->sin_addr.s_addr) return MPCP_ERR_TIMEOUT;
+size_t payload_len = (size_t)n;
+if (cfg->disguise_calibration) {
+payload_len = mpcp_disguise_unwrap(rx, (size_t)n, rx, sizeof(rx), cfg->disguise_protocol);
+if (payload_len == 0) return MPCP_ERR_PROTO;
+}
+uint64_t echoed_send_ts = 0;
+if (!parse_pong(rx, payload_len, seq, &echoed_send_ts)) return MPCP_ERR_PROTO;
+(void)echoed_send_ts;
+double rtt_ms = (double)(t1 - t0) / 1e6;
+if (rtt_ms <= 0.01 || rtt_ms > 5000.0) return MPCP_ERR_TIMEOUT;
+*rtt_ms_out = rtt_ms;
+if (t_send_raw_out) *t_send_raw_out = t0;
+if (t_recv_raw_out) *t_recv_raw_out = t1;
+return MPCP_OK;
+}
+
+static uint16_t calib_ghost_port(const mpcp_config_t *cfg, const mpcp_session_t *sess)
+{
+if (cfg->port_range == 0) return cfg->port_base;
+uint8_t digest[4];
+crypto_generichash_state st;
+crypto_generichash_init(&st, NULL, 0, sizeof(digest));
+crypto_generichash_update(&st, sess->session_nonce, MPCP_SESSION_NONCE_LEN);
+crypto_generichash_update(&st, (const unsigned char *)"cal-ghost", 9);
+crypto_generichash_final(&st, digest, sizeof(digest));
+uint32_t v = ((uint32_t)digest[0] << 24) | ((uint32_t)digest[1] << 16)
+| ((uint32_t)digest[2] << 8)  | ((uint32_t)digest[3]);
+return (uint16_t)(cfg->port_base + (v % cfg->port_range));
+}
+
 int mpcp_calibrate(const mpcp_config_t    *cfg,
 const mpcp_session_t   *sess,
 const struct sockaddr_in *peer_addr,
-mpcp_rtt_result_t      *result_out)
+mpcp_rtt_result_t      *result_out,
+mpcp_calib_t           *calib_out)
 {
-const uint32_t BURST = 64u;
-double rtts[64];
+if (!cfg || !sess || !peer_addr || !result_out || !calib_out) return MPCP_ERR_PARAM;
+memset(calib_out, 0, sizeof(*calib_out));
 int sock = cal_socket_open();
 if (sock < 0) return MPCP_ERR_IO;
-size_t n_collected = calibrate_standard(sock, peer_addr, BURST, BURST,
-sess->session_nonce, rtts,
-cfg->disguise_calibration, cfg->disguise_protocol);
+struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+(void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+/* Phase 1: 150-ping jitter profiling with IQR outlier reject */
+enum { PHASE1_TARGET = 150, PHASE1_MAX_ATTEMPTS = 300 };
+double raw_rtts[PHASE1_TARGET];
+size_t raw_n = 0;
+for (uint16_t seq = 1; seq <= PHASE1_MAX_ATTEMPTS && raw_n < PHASE1_TARGET; seq++) {
+double rtt_ms = 0.0;
+if (cal_ping_once_raw(sock, cfg, peer_addr, sess->session_nonce, seq, &rtt_ms, NULL, NULL) == MPCP_OK)
+raw_rtts[raw_n++] = rtt_ms;
+}
+if (raw_n < 30) { close(sock); return MPCP_ERR_TIMEOUT; }
+calib_out->samples_sent = (uint32_t)raw_n;
+double sorted[PHASE1_TARGET];
+memcpy(sorted, raw_rtts, raw_n * sizeof(double));
+insertion_sort_double(sorted, raw_n);
+double q1 = percentile_sorted(sorted, raw_n, 0.25);
+double q3 = percentile_sorted(sorted, raw_n, 0.75);
+double iqr = q3 - q1;
+double upper = q3 + 1.5 * iqr;
+double filt[PHASE1_TARGET];
+size_t fn = 0;
+for (size_t i = 0; i < raw_n; i++) {
+if (raw_rtts[i] <= upper) filt[fn++] = raw_rtts[i];
+}
+if (fn < 10) { close(sock); return MPCP_ERR_TIMEOUT; }
+double mean = 0.0;
+for (size_t i = 0; i < fn; i++) mean += filt[i];
+mean /= (double)fn;
+double var = 0.0;
+for (size_t i = 0; i < fn; i++) {
+double d = filt[i] - mean;
+var += d * d;
+}
+var = (fn > 1) ? (var / (double)(fn - 1)) : 0.0;
+calib_out->stable_mean_rtt_ms = mean;
+calib_out->jitter_variance_ms2 = var;
+calib_out->samples_kept = (uint32_t)fn;
+
+/* Phase 2: 2-second drift synthesis via RTT trend slope */
+uint64_t t_start = mpcp_now_raw_ns();
+uint64_t t_end = t_start + 2000000000ULL;
+double x_sum = 0.0, y_sum = 0.0, x2_sum = 0.0, xy_sum = 0.0;
+size_t n = 0;
+uint16_t seq = 1000;
+while (mpcp_now_raw_ns() < t_end) {
+double rtt_ms = 0.0;
+uint64_t ts = 0, tr = 0;
+if (cal_ping_once_raw(sock, cfg, peer_addr, sess->session_nonce, seq++, &rtt_ms, &ts, &tr) == MPCP_OK) {
+double x = (double)(ts - t_start) / 1e9;
+double y = rtt_ms / 2.0;
+x_sum += x; y_sum += y; x2_sum += x * x; xy_sum += x * y;
+n++;
+}
+struct timespec nap = { .tv_sec = 0, .tv_nsec = 2000000L };
+nanosleep(&nap, NULL);
+}
+double slope_ms_per_s = 0.0;
+if (n >= 2) {
+double den = (double)n * x2_sum - x_sum * x_sum;
+if (fabs(den) > 1e-12) slope_ms_per_s = (((double)n * xy_sum) - (x_sum * y_sum)) / den;
+}
+calib_out->drift_ppm = slope_ms_per_s * 1000.0;
+calib_out->drift_coefficient = 1.0 + (calib_out->drift_ppm / 1000000.0);
+
+/* Phase 3: dynamic cadence selection */
+if (cfg->blink_interval_us > 0) {
+calib_out->blink_interval_ns = (uint64_t)cfg->blink_interval_us * 1000ULL;
+} else {
+double jitter_us = sqrt(var) * 1000.0;
+if (jitter_us < 100.0) calib_out->blink_interval_ns = 10000000ULL;
+else if (jitter_us > 5000.0) calib_out->blink_interval_ns = 500000000ULL;
+else if (jitter_us > 1000.0) calib_out->blink_interval_ns = 100000000ULL;
+else calib_out->blink_interval_ns = 25000000ULL;
+}
+
+/* Phase 4: epoch handshake + bounded ghost verification */
+calib_out->ghost_port = calib_ghost_port(cfg, sess);
+struct sockaddr_in ghost_peer = *peer_addr;
+ghost_peer.sin_port = htons(calib_out->ghost_port);
+calib_out->tzero_ns = mpcp_now_raw_ns() + 2000000000ULL;
+uint64_t fire_ns = calib_out->tzero_ns + calib_out->blink_interval_ns;
+while (mpcp_now_raw_ns() < fire_ns) {
+uint64_t rem = fire_ns - mpcp_now_raw_ns();
+struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)((rem > 1000000ULL) ? 1000000ULL : rem) };
+nanosleep(&ts, NULL);
+}
+mpcp_cal_pkt_t ghost;
+build_ping(&ghost, 0xEE01u, sess->session_nonce);
+uint8_t wire[MPCP_CAL_WIRE_BUF];
+size_t wire_len = sizeof(ghost);
+if (cfg->disguise_calibration) {
+wire_len = mpcp_disguise_wrap((const uint8_t *)&ghost, sizeof(ghost), wire,
+sizeof(wire), cfg->disguise_protocol);
+if (wire_len == 0) { close(sock); return MPCP_ERR_PROTO; }
+} else {
+memcpy(wire, &ghost, sizeof(ghost));
+}
+if (sendto(sock, wire, wire_len, 0, (const struct sockaddr *)&ghost_peer, sizeof(ghost_peer)) < 0) {
+close(sock); return MPCP_ERR_IO;
+}
+struct timeval strict = { .tv_sec = 0, .tv_usec = (suseconds_t)((calib_out->blink_interval_ns / 4ULL) / 1000ULL) };
+if (strict.tv_usec < 10000) strict.tv_usec = 10000;
+if (strict.tv_usec > 250000) strict.tv_usec = 250000;
+(void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &strict, sizeof(strict));
+uint8_t rx[MPCP_CAL_WIRE_BUF];
+struct sockaddr_in from;
+socklen_t fromlen = sizeof(from);
+ssize_t rn = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+if (rn > 0) {
+size_t plen = (size_t)rn;
+if (cfg->disguise_calibration)
+plen = mpcp_disguise_unwrap(rx, plen, rx, sizeof(rx), cfg->disguise_protocol);
+uint64_t ts_echo = 0;
+if (plen > 0 && parse_pong(rx, plen, 0xEE01u, &ts_echo)) calib_out->handshake_locked = true;
+}
+if (!calib_out->handshake_locked) { close(sock); return MPCP_ERR_TIMEOUT; }
+fprintf(stderr, "[Sync] Sender math complete, signaling Receiver...\n");
+for (int i = 0; i < 5; i++) {
+mpcp_cal_pkt_t ready;
+build_ping(&ready, (uint16_t)(0xF000u + (uint16_t)i), sess->session_nonce);
+ready.hdr.type = MPCP_SIG_READY;
+uint8_t wire_ready[MPCP_CAL_WIRE_BUF];
+size_t wire_len_ready = sizeof(ready);
+if (cfg->disguise_calibration) {
+wire_len_ready = mpcp_disguise_wrap((const uint8_t *)&ready, sizeof(ready),
+wire_ready, sizeof(wire_ready), cfg->disguise_protocol);
+if (wire_len_ready == 0) continue;
+} else {
+memcpy(wire_ready, &ready, sizeof(ready));
+}
+(void)sendto(sock, wire_ready, wire_len_ready, 0,
+(const struct sockaddr *)peer_addr, sizeof(*peer_addr));
+struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000L };
+nanosleep(&ts, NULL);
+}
 close(sock);
-if (n_collected < 3) return MPCP_ERR_TIMEOUT;
-double sorted[64];
-memcpy(sorted, rtts, n_collected * sizeof(double));
-for (size_t _si = 1; _si < n_collected; _si++) {
-double _key = sorted[_si];
-ssize_t _sj = (ssize_t)_si - 1;
-while (_sj >= 0 && sorted[_sj] > _key) { sorted[_sj + 1] = sorted[_sj]; _sj--; }
-sorted[_sj + 1] = _key;
-}
-size_t _trim = (size_t)(n_collected / 10u);
-size_t _lo = _trim;
-size_t _hi = n_collected - _trim;
-if (_hi <= _lo) { _hi = n_collected; _lo = 0; }
-size_t _mid_count = _hi - _lo;
-size_t _mid = _lo + _mid_count / 2u;
-double _median = (_mid_count % 2u == 0u)
-? (sorted[_mid - 1u] + sorted[_mid]) / 2.0
-: sorted[_mid];
-result_out->median_rtt    = _median;
-result_out->trimmed_mean  = _median;
-result_out->ewma_rtt      = _median;
-result_out->sample_count  = (uint32_t)_mid_count;
-double _mad_vals[64] = {0};
-for (size_t _mi = _lo; _mi < _hi; _mi++)
-_mad_vals[_mi - _lo] = fabs(sorted[_mi] - _median);
-for (size_t _si = 1; _si < _mid_count; _si++) {
-double _key = _mad_vals[_si];
-ssize_t _sj = (ssize_t)_si - 1;
-while (_sj >= 0 && _mad_vals[_sj] > _key) { _mad_vals[_sj + 1] = _mad_vals[_sj]; _sj--; }
-_mad_vals[_sj + 1] = _key;
-}
-size_t _mhalf = _mid_count / 2u;
-double _mad = (_mid_count % 2u == 0u)
-? (_mad_vals[_mhalf - 1u] + _mad_vals[_mhalf]) / 2.0
-: _mad_vals[_mhalf];
-result_out->mad           = _mad;
-result_out->robust_std    = 1.4826 * _mad;
-result_out->baseline_mean = _median;
-result_out->baseline_std  = result_out->robust_std;
-result_out->catch_window  = compute_catch_window(
-result_out->ewma_rtt,
+
+result_out->trimmed_mean  = calib_out->stable_mean_rtt_ms;
+result_out->median_rtt    = calib_out->stable_mean_rtt_ms;
+result_out->mad           = sqrt(calib_out->jitter_variance_ms2);
+result_out->robust_std    = result_out->mad;
+result_out->ewma_rtt      = calib_out->stable_mean_rtt_ms;
+result_out->baseline_mean = calib_out->stable_mean_rtt_ms;
+result_out->baseline_std  = (result_out->robust_std > 1e-6) ? result_out->robust_std : 1e-6;
+result_out->catch_window  = compute_catch_window(result_out->ewma_rtt,
 result_out->robust_std,
 cfg->stddev_multiplier,
 (double)cfg->floor_buffer,
 (double)cfg->max_catch_window);
+result_out->sample_count  = calib_out->samples_kept;
 return MPCP_OK;
 }
+
 void mpcp_cal_ewma_update(mpcp_rtt_result_t *result,
 double new_rtt_ms,
 double alpha)
@@ -2238,6 +2468,8 @@ sess->blink_interval_ns = 200000000ULL;
 }
 const uint64_t ORIGIN_GUARD_NS = 1500000000ULL;
 sess->blink_origin_ns = mpcp_now_ns() + ORIGIN_GUARD_NS;
+sess->t_zero_ns = sess->blink_origin_ns;
+sess->drift_coefficient = 1.0;
 fprintf(stderr, "[blink] calibrated: interval=%.1fms  origin_in=%.0fms\n",
 (double)sess->blink_interval_ns / 1e6,
 (double)(int64_t)(sess->blink_origin_ns - mpcp_now_ns()) / 1e6);
@@ -2675,7 +2907,7 @@ struct sockaddr_in addr = {
 if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
 close(fd); return -1;
 }
-struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 return fd;
 }
@@ -2691,7 +2923,7 @@ uint16_t p = kex_port(master_secret, session_nonce, i,
 port_base, port_range);
 socks[i].fd   = open_udp_port(p);
 socks[i].port = p;
-if (socks[i].fd >= 0) opened++;
+if (socks[i].fd >= 0) { opened++; fprintf(stderr, "[Handshake] Successfully bound KEX port %u\n", p); }
 else fprintf(stderr, "[exchange] open port %u: %s\n", p, strerror(errno));
 }
 return opened;
@@ -2780,6 +3012,64 @@ if (rc != MPCP_OK) fprintf(stderr, "[exchange] Ed25519 auth FAILED\n");
 else               fprintf(stderr, "[exchange] Ed25519 auth OK\n");
 return rc;
 }
+typedef struct __attribute__((packed)) {
+mpcp_hdr_t hdr;
+uint64_t   tzero_ns_be;
+} mpcp_kex_sync_pkt_t;
+
+static int kex_send_tzero_sync(const mpcp_config_t *cfg,
+const mpcp_session_t *sess,
+const struct sockaddr_in *pc1_addr,
+uint64_t tzero_ns)
+{
+uint16_t auth_port = kex_port(sess->master_secret, sess->session_nonce,
+0xFFFFFFFFu, cfg->port_base, cfg->port_range);
+int fd = socket(AF_INET, SOCK_DGRAM, 0);
+if (fd < 0) return MPCP_ERR_IO;
+mpcp_kex_sync_pkt_t pkt;
+memset(&pkt, 0, sizeof(pkt));
+uint32_t magic_be = htonl(MPCP_MAGIC);
+memcpy(&pkt.hdr.magic, &magic_be, 4);
+pkt.hdr.version = MPCP_VERSION;
+pkt.hdr.type    = MPCP_TYPE_ACK;
+pkt.tzero_ns_be = __builtin_bswap64(tzero_ns);
+struct sockaddr_in dst = *pc1_addr;
+dst.sin_port = htons(auth_port);
+for (int i = 0; i < 5; i++) {
+sendto(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst));
+struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
+nanosleep(&ts, NULL);
+}
+close(fd);
+return MPCP_OK;
+}
+
+static int kex_recv_tzero_sync(const mpcp_config_t *cfg,
+mpcp_session_t *sess,
+const struct sockaddr_in *expected_peer,
+uint64_t *tzero_out)
+{
+uint16_t auth_port = kex_port(sess->master_secret, sess->session_nonce,
+0xFFFFFFFFu, cfg->port_base, cfg->port_range);
+int fd = open_udp_port(auth_port);
+if (fd < 0) return MPCP_ERR_IO;
+struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+int pr = poll(&pfd, 1, 3000);
+if (pr <= 0) { close(fd); return MPCP_ERR_TIMEOUT; }
+mpcp_kex_sync_pkt_t pkt;
+struct sockaddr_in from; socklen_t fl = sizeof(from);
+ssize_t n = recvfrom(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fl);
+close(fd);
+if (n != (ssize_t)sizeof(pkt)) return MPCP_ERR_PROTO;
+if (expected_peer && from.sin_addr.s_addr != expected_peer->sin_addr.s_addr) return MPCP_ERR_PROTO;
+uint32_t magic;
+memcpy(&magic, &pkt.hdr.magic, 4);
+if (ntohl(magic) != MPCP_MAGIC || pkt.hdr.version != MPCP_VERSION || pkt.hdr.type != MPCP_TYPE_ACK)
+return MPCP_ERR_PROTO;
+*tzero_out = __builtin_bswap64(pkt.tzero_ns_be);
+return MPCP_OK;
+}
+
 int mpcp_exchange_pc1(const mpcp_config_t     *cfg,
 mpcp_session_t          *sess,
 const struct sockaddr_in *pc2_addr,
@@ -2835,9 +3125,23 @@ sendto(socks[i].fd, &pc1_pkts[i], sizeof(pc1_pkts[i]), 0,
 (struct sockaddr *)&dst, sizeof(dst));
 }
 fprintf(stderr, "[exchange] PC1: sent %u candidates (retransmit)\n", N);
-next_send = mpcp_now_ns() + 500000000ULL;
+next_send = mpcp_now_ns() + 100000000ULL;
 }
 bool any_new = false;
+struct pollfd pset[MPCP_MAX_CANDIDATES];
+nfds_t pcount = 0;
+for (uint32_t i = 0; i < N; i++) {
+if (socks[i].fd < 0 || received[i]) continue;
+pset[pcount].fd = socks[i].fd;
+pset[pcount].events = POLLIN;
+pset[pcount].revents = 0;
+pcount++;
+}
+if (pcount == 0 || poll(pset, pcount, 2000) <= 0) {
+struct timespec ts = {0, 1000000L};
+nanosleep(&ts, NULL);
+continue;
+}
 for (uint32_t i = 0; i < N; i++) {
 if (socks[i].fd < 0 || received[i]) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
@@ -2856,6 +3160,7 @@ if (idx < N && !received[idx]) {
 memcpy(recv_keys[idx], tmp, 32);
 received[idx] = true;
 any_new = true;
+fprintf(stderr, "[Handshake] Received peer candidate idx=%u on port %u\n", idx, socks[i].port);
 }
 sodium_memzero(tmp, 32);
 }
@@ -2888,6 +3193,15 @@ if (rc != MPCP_OK) goto done_pc1;
 mpcp_keygen_candidates_wipe_losers(cands_out, selected_idx);
 rc = auth_send_sig(cfg, sess, pc2_addr);
 if (rc != MPCP_OK) goto done_pc1;
+{
+uint64_t synced_tzero = 0;
+int src = kex_recv_tzero_sync(cfg, sess, pc2_addr, &synced_tzero);
+if (src == MPCP_OK) {
+sess->t_zero_ns = synced_tzero;
+sess->blink_origin_ns = synced_tzero;
+fprintf(stderr, "[Handshake] Synchronized T-Zero to %llu\n", (unsigned long long)synced_tzero);
+}
+}
 fprintf(stderr, "[exchange] PC1: session key ready\n");
 rc = MPCP_OK;
 done_pc1:
@@ -2930,6 +3244,20 @@ uint32_t cnt_check = 0;
 for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt_check++;
 if (cnt_check == N) break;
 bool any_new = false;
+struct pollfd pset[MPCP_MAX_CANDIDATES];
+nfds_t pcount = 0;
+for (uint32_t i = 0; i < N; i++) {
+if (got_key[i] || recv_socks[i].fd < 0) continue;
+pset[pcount].fd = recv_socks[i].fd;
+pset[pcount].events = POLLIN;
+pset[pcount].revents = 0;
+pcount++;
+}
+if (pcount == 0 || poll(pset, pcount, 2000) <= 0) {
+struct timespec ts = {0, 1000000L};
+nanosleep(&ts, NULL);
+continue;
+}
 for (uint32_t i = 0; i < N; i++) {
 if (got_key[i] || recv_socks[i].fd < 0) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
@@ -2944,6 +3272,7 @@ if (mpcp_kex_unpack(sess->master_secret, pkt, all_keys[i]) != MPCP_OK)
 continue;
 got_key[i] = true;
 any_new = true;
+fprintf(stderr, "[Handshake] Received peer candidate idx=%u on port %u\n", i, recv_socks[i].port);
 }
 if (!any_new) {
 struct timespec ts = {0, 1000000L};
@@ -3042,6 +3371,11 @@ free(send_socks);
 free_key_bufs(return_buf, N);
 rc = auth_recv_verify(cfg, sess);
 if (rc != MPCP_OK) goto done_pc2;
+uint64_t final_tzero = mpcp_now_ns() + 2000000000ULL;
+sess->t_zero_ns = final_tzero;
+sess->blink_origin_ns = final_tzero;
+(void)kex_send_tzero_sync(cfg, sess, pc1_addr, final_tzero);
+fprintf(stderr, "[Handshake] Synchronized T-Zero to %llu\n", (unsigned long long)final_tzero);
 fprintf(stderr, "[exchange] PC2: exchange complete, session key ready\n");
 rc = MPCP_OK;
 done_pc2:
@@ -3474,8 +3808,8 @@ uint32_t              chunk_idx)
 if (sess->blink_interval_ns == 0) {
 return mpcp_now_ns();
 }
-return sess->blink_origin_ns
-+ (uint64_t)chunk_idx * sess->blink_interval_ns;
+uint64_t base = sess->t_zero_ns ? sess->t_zero_ns : sess->blink_origin_ns;
+return base + (uint64_t)chunk_idx * sess->blink_interval_ns;
 }
 static ssize_t blink_recv_window(int fd, void *buf, size_t buf_len,
 uint64_t target_ns, uint64_t guard_ns,
@@ -4211,8 +4545,13 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   return NULL;
   }
   bool use_blink_pacer = (ctx->sess->blink_interval_ns > 0);
-  uint64_t _origin_ns = ctx->sess->blink_origin_ns;
+  uint64_t _origin_ns = ctx->sess->t_zero_ns ? ctx->sess->t_zero_ns : ctx->sess->blink_origin_ns;
   uint64_t _blink_interval_ns = ctx->sess->blink_interval_ns;
+  double   _drift = (ctx->sess->drift_coefficient > 0.0) ? ctx->sess->drift_coefficient : 1.0;
+  double   _pid_i = 0.0;
+  double   _pid_c = 0.0;
+  const double _kp = 0.3;
+  const double _ki = 0.02;
   uint32_t _block_size = ctx->block_size;
   uint32_t _block_base = ctx->block_base;
   while (data_consumed < _block_size) {
@@ -4228,11 +4567,11 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   memcpy(&dest, ctx->peer_addr, sizeof(dest));
   dest.sin_port = htons(port);
   if (use_blink_pacer) {
-  uint64_t _abs_target = _origin_ns + ((uint64_t)seq * _blink_interval_ns);
-  struct timespec _abs_ts;
-  _abs_ts.tv_sec  = (time_t)(_abs_target / 1000000000ULL);
-  _abs_ts.tv_nsec = (long)(_abs_target % 1000000000ULL);
-  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &_abs_ts, NULL);
+  double scaled = (double)seq * (double)_blink_interval_ns * _drift;
+  int64_t _abs_target_i = (int64_t)_origin_ns + (int64_t)scaled + (int64_t)_pid_c
+                        + (int64_t)schedule_jitter_ns(ctx->sess, seq);
+  uint64_t _abs_target = (_abs_target_i > 0) ? (uint64_t)_abs_target_i : _origin_ns;
+  mpcp_precise_wait_ns(_abs_target, 50000ULL);
   }
   (void)send_chunk_packet(persist_sock, &dest, ctx->sess, slot,
   MPCP_TYPE_DATA_CHUNK, 0,
@@ -4251,6 +4590,16 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   /* Run Kalman if the ACK thread deposited a new RTT sample */
   if (atomic_load_explicit(&sw->rtt_sample_ns, memory_order_relaxed) != 0u)
       mpcp_sw_kalman_update(sw);
+  if (use_blink_pacer) {
+      double kf_ms = (double)(int32_t)(sw->kf_rtt_estimate >> 16);
+      double err_ns = (kf_ms * 1000000.0) * 0.5;
+      _pid_i += err_ns;
+      if (_pid_i > 5000000.0) _pid_i = 5000000.0;
+      if (_pid_i < -5000000.0) _pid_i = -5000000.0;
+      _pid_c += (_kp * err_ns) + (_ki * _pid_i);
+      if (_pid_c > 5000000.0) _pid_c = 5000000.0;
+      if (_pid_c < -5000000.0) _pid_c = -5000000.0;
+  }
   /* Inflight window gate: spin until there is credit.
    * retx_timeout_ns doubles as the gate spin limit — if we have been
    * stalled longer than one RTO something has gone wrong; let the
@@ -4752,6 +5101,120 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint32_t            *block_seqs;
   uint32_t             catch_window_ms;
   } recv_t1_arg_t;
+  typedef struct {
+  uint32_t chunk_index;
+  uint64_t expected_arrival_ns;
+  uint16_t ephemeral_port;
+  uint8_t  sub_index;
+  int32_t  jitter_ns;
+  } schedule_entry_t;
+  static uint16_t blink_hop_port_subidx(const mpcp_session_t *sess,
+  const mpcp_config_t *cfg,
+  uint32_t chunk_idx,
+  uint8_t sub_index)
+  {
+  uint32_t hop_interval = (cfg->port_hop_interval > 0) ? cfg->port_hop_interval : 1u;
+  uint32_t hop_base     = (chunk_idx / hop_interval) * hop_interval;
+  uint8_t nonce_x[MPCP_SESSION_NONCE_LEN];
+  memcpy(nonce_x, sess->session_nonce, MPCP_SESSION_NONCE_LEN);
+  nonce_x[chunk_idx % MPCP_SESSION_NONCE_LEN] ^= sub_index;
+  uint8_t ikm[9 + 4 + MPCP_SESSION_NONCE_LEN];
+  memcpy(ikm, "blink-hop", 9);
+  ikm[9]  = (uint8_t)((hop_base >> 24) & 0xFF);
+  ikm[10] = (uint8_t)((hop_base >> 16) & 0xFF);
+  ikm[11] = (uint8_t)((hop_base >>  8) & 0xFF);
+  ikm[12] = (uint8_t)( hop_base        & 0xFF);
+  memcpy(ikm + 13, nonce_x, MPCP_SESSION_NONCE_LEN);
+  uint8_t out[4];
+  if (mpcp_hkdf(sess->session_key, MPCP_SESSION_KEY_LEN,
+  ikm, sizeof(ikm), "mpcp-v0.5-blink-hop", out, 4) != MPCP_OK) {
+  sodium_memzero(nonce_x, sizeof(nonce_x));
+  return blink_hop_port(sess, cfg, chunk_idx);
+  }
+  sodium_memzero(nonce_x, sizeof(nonce_x));
+  uint32_t seed = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
+  ((uint32_t)out[2] <<  8) |  (uint32_t)out[3];
+  return (uint16_t)(seed % cfg->port_range + cfg->port_base);
+  }
+  static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq)
+  {
+  uint8_t out[4];
+  uint8_t ikm[8];
+  ikm[0] = (uint8_t)(seq >> 24); ikm[1] = (uint8_t)(seq >> 16);
+  ikm[2] = (uint8_t)(seq >>  8); ikm[3] = (uint8_t)seq;
+  ikm[4] = 'j'; ikm[5] = 'i'; ikm[6] = 't'; ikm[7] = 'r';
+  if (mpcp_hkdf(sess->session_key, MPCP_SESSION_KEY_LEN,
+  ikm, sizeof(ikm), "mpcp-v0.5-heisenberg-jitter", out, 4) != MPCP_OK)
+  return 0;
+  uint32_t v = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
+  ((uint32_t)out[2] << 8) | (uint32_t)out[3];
+  int32_t span = 100001; /* [-50000, +50000] ns */
+  return (int32_t)(v % (uint32_t)span) - 50000;
+  }
+  static void mpcp_generate_schedule(const mpcp_session_t *sess,
+  const mpcp_config_t *cfg,
+  const uint32_t *seqs,
+  uint32_t n,
+  uint64_t tzero_ns,
+  uint64_t interval_ns,
+  double drift_coefficient,
+  schedule_entry_t *out)
+  {
+  for (uint32_t i = 0; i < n; i++) {
+  uint32_t seq = seqs[i];
+  out[i].chunk_index = seq;
+  double scaled = (double)i * (double)interval_ns * drift_coefficient;
+  int64_t target = (int64_t)tzero_ns + (int64_t)scaled;
+  int32_t jit = schedule_jitter_ns(sess, seq);
+  out[i].jitter_ns = jit;
+  out[i].expected_arrival_ns = (target + jit > 0) ? (uint64_t)(target + jit) : tzero_ns;
+  uint8_t sub = 0;
+  uint16_t p = blink_hop_port_subidx(sess, cfg, seq, sub);
+  for (;;) {
+  bool collides = false;
+  uint32_t j0 = (i > 10u) ? (i - 10u) : 0u;
+  for (uint32_t j = j0; j < i; j++) {
+  if (out[j].ephemeral_port == p) { collides = true; break; }
+  }
+  if (!collides || sub == 255u) break;
+  sub++;
+  p = blink_hop_port_subidx(sess, cfg, seq, sub);
+  }
+  out[i].sub_index = sub;
+  out[i].ephemeral_port = p;
+  }
+  }
+  static void sleep_until_raw_abs(uint64_t when_ns)
+  {
+  struct timespec ts;
+  ts.tv_sec  = (time_t)(when_ns / 1000000000ULL);
+  ts.tv_nsec = (long)(when_ns % 1000000000ULL);
+  (void)clock_nanosleep(CLOCK_MONOTONIC_RAW, TIMER_ABSTIME, &ts, NULL);
+  }
+  static bool receiver_validate_ciphertext(const mpcp_session_t *sess,
+  const mpcp_config_t *cfg,
+  uint32_t seq,
+  const uint8_t nonce[24],
+  const uint8_t *ct,
+  size_t ct_len,
+  uint32_t data_len)
+  {
+  static const uint8_t zero_nonce[24] = {0};
+  if (sodium_memcmp(nonce, zero_nonce, sizeof(zero_nonce)) == 0) return false;
+  uint8_t chunk_key[32];
+  uint16_t kp = 0;
+  mpcp_get_chunk_params(sess, cfg, seq, chunk_key, &kp);
+  (void)kp;
+  uint8_t plain[63488];
+  size_t plain_len = 0;
+  int rc = mpcp_chunk_decrypt(chunk_key, sess->session_nonce, seq,
+  nonce, ct, ct_len,
+  plain, &plain_len);
+  sodium_memzero(chunk_key, sizeof(chunk_key));
+  sodium_memzero(plain, sizeof(plain));
+  if (rc != MPCP_OK) return false;
+  return data_len <= plain_len;
+  }
   static void *thread_receiver_t1(void *arg)
   {
   recv_t1_arg_t       *a   = arg;
@@ -4770,88 +5233,91 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (sess->blink_interval_ns > 0) {
   blink_window_t win;
   blink_window_init(&win);
-  uint64_t deadline_ns = mpcp_now_ns()
-  + (uint64_t)cfg->chunk_retry_timeout * 4ULL * 1000000000ULL
-  + 60000000000ULL;
-  int      blink_fd  = -1;
-  uint16_t cur_port  = 0;
+  uint64_t now_raw = mpcp_now_raw_ns();
+  uint64_t tzero = sess->t_zero_ns ? sess->t_zero_ns : sess->blink_origin_ns;
+  if (tzero == 0) tzero = now_raw + 1000000000ULL;
+  double drift = (sess->drift_coefficient > 0.0) ? sess->drift_coefficient : 1.0;
+  schedule_entry_t *sched = calloc(n, sizeof(*sched));
   bool *got = calloc(n, sizeof(bool));
-  if (!got) {
-  free(pkt);
+  if (!sched || !got) {
+  free(sched); free(got); free(pkt);
   atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
   return NULL;
   }
-  for (uint32_t i = 0; i < n && mpcp_now_ns() < deadline_ns; i++) {
+  mpcp_generate_schedule(sess, cfg, a->block_seqs, n,
+  tzero, sess->blink_interval_ns, drift, sched);
+  double pid_integral_ns = 0.0;
+  double pid_correction_ns = 0.0;
+  const double Kp = 0.3;
+  const double Ki = 0.02;
+  for (uint32_t i = 0; i < n; i++) {
   if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
-  uint32_t seq = a->block_seqs[i];
+  uint32_t seq = sched[i].chunk_index;
   bool is_ghost = false;
   for (uint32_t g = 0; g < ctx->ghost_count; g++) {
   if (ctx->ghost_seqs[g] == seq) { is_ghost = true; break; }
   }
-  if (is_ghost) { got[i] = true; received++; continue; }
-  uint16_t needed_port = blink_hop_port(sess, cfg, seq);
-  if (needed_port != cur_port || blink_fd < 0) {
-  if (blink_fd >= 0) { close(blink_fd); blink_fd = -1; }
-  blink_fd = open_udp_socket_on_port(needed_port);
-  if (blink_fd < 0) {
-  fprintf(stderr, "[blink] bind port %u failed: %s\n",
-  needed_port, strerror(errno));
-  atomic_fetch_add_explicit(&g_blink_missed_windows, 1,
-  memory_order_relaxed);
+  int64_t expected_adj = (int64_t)sched[i].expected_arrival_ns + (int64_t)pid_correction_ns;
+  uint64_t expected = (expected_adj > 0) ? (uint64_t)expected_adj : sched[i].expected_arrival_ns;
+  uint64_t open_at = (expected > 5000000ULL) ? expected - 5000000ULL : expected;
+  if (mpcp_now_raw_ns() < open_at) sleep_until_raw_abs(open_at);
+  int jit_fd = open_udp_socket_on_port(sched[i].ephemeral_port);
+  if (jit_fd < 0) {
+  atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
   continue;
   }
-  cur_port = needed_port;
+  struct sockaddr_in fsrc; socklen_t fsl = sizeof(fsrc);
+  ssize_t nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
+  (struct sockaddr *)&fsrc, &fsl);
+  if (nb < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+  struct pollfd pfd = { .fd = jit_fd, .events = POLLIN, .revents = 0 };
+  int pr = poll(&pfd, 1, 10);
+  if (pr > 0 && (pfd.revents & POLLIN)) {
+  nb = recvfrom(jit_fd, pkt, pkt_max, MSG_DONTWAIT,
+  (struct sockaddr *)&fsrc, &fsl);
   }
-  uint64_t t_arrival = blink_arrival_time(sess, seq);
-  const uint64_t GUARD_NS = (sess->blink_interval_ns == 0)
-                          ? 50000000ULL : 5000000ULL;
-  struct sockaddr_in from_addr;
-  socklen_t          from_len = sizeof(from_addr);
-  ssize_t nb = blink_recv_window(blink_fd, pkt, pkt_max,
-  t_arrival, GUARD_NS,
-  &from_addr, &from_len);
-  if (nb < 0) {
+  }
+  if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) {
+  close(jit_fd);
+  atomic_fetch_add_explicit(&g_blink_missed_windows, 1u, memory_order_relaxed);
   blink_window_record(&win, false);
-  if (g_debug_stealth)
-  fprintf(stderr, "  [blink] seq=%u missed primary (port=%u)\n",
-  seq, cur_port);
-  nb = blink_recv_window(blink_fd, pkt, pkt_max,
-  t_arrival + GUARD_NS, GUARD_NS,
-  &from_addr, &from_len);
-  if (nb < 0) continue;
+  continue;
   }
-  if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
-  uint32_t magic;
-  memcpy(&magic, pkt, 4);
-  if (ntohl(magic) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
-  if (pkt[5] != MPCP_TYPE_DATA_CHUNK &&
-  pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
-  uint32_t pkt_seq;
-  memcpy(&pkt_seq, pkt + 6, 4);
-  pkt_seq = ntohl(pkt_seq);
+  uint32_t magic; memcpy(&magic, pkt, 4);
+  if (ntohl(magic) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) {
+  close(jit_fd); continue;
+  }
+  if (pkt[5] != MPCP_TYPE_DATA_CHUNK && pkt[5] != MPCP_TYPE_GHOST_CHUNK) {
+  close(jit_fd); continue;
+  }
+  uint32_t pkt_seq; memcpy(&pkt_seq, pkt + 6, 4); pkt_seq = ntohl(pkt_seq);
+  int64_t err_ns = (int64_t)mpcp_now_raw_ns() - (int64_t)expected;
+  pid_integral_ns += (double)err_ns;
+  if (pid_integral_ns > 5000000.0) pid_integral_ns = 5000000.0;
+  if (pid_integral_ns < -5000000.0) pid_integral_ns = -5000000.0;
+  pid_correction_ns += Kp * (double)err_ns + Ki * pid_integral_ns;
+  if (pid_correction_ns > 5000000.0) pid_correction_ns = 5000000.0;
+  if (pid_correction_ns < -5000000.0) pid_correction_ns = -5000000.0;
   bool pkt_is_ghost = false;
   for (uint32_t g = 0; g < ctx->ghost_count; g++)
   if (ctx->ghost_seqs[g] == pkt_seq) { pkt_is_ghost = true; break; }
-  if (pkt_is_ghost) {
-  got[i] = true; received++;
-  blink_window_record(&win, true);
+  if (pkt_is_ghost || is_ghost) {
+  close(jit_fd);
+  got[i] = true; received++; blink_window_record(&win, true);
   continue;
   }
-  if (!mpcp_dedup_accept(&ctx->dedup, pkt_seq)) {
-  blink_window_record(&win, true);
+  size_t ct_len = (size_t)(nb - (ssize_t)MPCP_DATA_HDR_OFFSET);
+  uint32_t data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12));
+  const uint8_t *nonce = pkt + 16;
+  const uint8_t *ct = pkt + MPCP_DATA_HDR_OFFSET;
+  bool auth_ok = receiver_validate_ciphertext(sess, cfg, pkt_seq,
+  nonce, ct, ct_len, data_len);
+  if (!auth_ok || !mpcp_dedup_accept(&ctx->dedup, pkt_seq)) {
+  close(jit_fd);
+  blink_window_record(&win, false);
   continue;
   }
-  mpcp_ring_slot_t *slot = mpcp_ring_claim(&ctx->ring0);
-  slot->seq_index = pkt_seq;
-  slot->flags     = pkt[11];
-  size_t ct_len   = (size_t)(nb - (ssize_t)MPCP_DATA_HDR_OFFSET);
-  if (ct_len > slot->buf_capacity) ct_len = slot->buf_capacity;
-  memcpy(slot->buf,   pkt + MPCP_DATA_HDR_OFFSET, ct_len);
-  slot->ct_len   = ct_len;
-  slot->data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12));
-  memcpy(slot->nonce, pkt + 16, 24);
-  mpcp_ring_publish(&ctx->ring0, slot);
   {
   mpcp_ack_pkt_t ack;
   memset(&ack, 0, sizeof(ack));
@@ -4864,58 +5330,32 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint8_t ah[4];
   if (mpcp_ack_hash(sess->session_key, pkt_seq, ah) == MPCP_OK)
   memcpy(&ack.ack_hash, ah, 4);
-  ack.sack_bitmap = 0;
   randombytes_buf(ack.padding, sizeof(ack.padding));
-  sendto(blink_fd, &ack, sizeof(ack), 0,
-  (const struct sockaddr *)&from_addr, from_len);
+  sendto(jit_fd, &ack, sizeof(ack), 0, (const struct sockaddr *)&fsrc, fsl);
   }
-  {
-  #ifdef MPCP_COLOUR_UI
-  int fill = (int)(40.0f * (float)(received + 1) /
-  (float)(ctx->plan.n_chunks > 0
-  ? ctx->plan.n_chunks : 1));
-  fprintf(stderr, "\r  %s[%s", C_GRAPE, C_RESET);
-  for (int _b = 0; _b < 40; _b++) {
-  if (_b < fill)
-  fprintf(stderr, "%s\xe2\x96\x88%s",
-  _b == fill-1 ? C_PLUM : C_VIOLET, C_RESET);
-  else if (_b == fill)
-  fprintf(stderr, "%s\xe2\x96\x8c%s", C_GRAPE, C_RESET);
-  else
-  fprintf(stderr, "%s\xe2\x96\x91%s", C_GRAPE, C_RESET);
-  }
-  fprintf(stderr,
-  "%s] %s%u/%u%s :%u miss:%.0f%%   ",
-  C_GRAPE, C_PLUM, received + 1, ctx->plan.n_chunks,
-  C_RESET, cur_port,
+  close(jit_fd);
+  mpcp_ring_slot_t *slot = mpcp_ring_claim(&ctx->ring0);
+  slot->seq_index = pkt_seq;
+  slot->flags     = pkt[11];
+  if (ct_len > slot->buf_capacity) ct_len = slot->buf_capacity;
+  memcpy(slot->buf, ct, ct_len);
+  slot->ct_len   = ct_len;
+  slot->data_len = data_len;
+  memcpy(slot->nonce, nonce, 24);
+  mpcp_ring_publish(&ctx->ring0, slot);
+  got[i] = true;
+  received++;
+  blink_window_record(&win, true);
+  fprintf(stderr, "\r  [JIT %u/%u] port=%u miss=%.0f%%   ",
+  received, ctx->plan.n_chunks,
+  sched[i].ephemeral_port,
   blink_window_miss_rate(&win) * 100.0);
-  #else
-  fprintf(stderr, "\r  [%u/%u] :%u miss=%.0f%%   ",
-  received + 1, ctx->plan.n_chunks, cur_port,
-  blink_window_miss_rate(&win) * 100.0);
-  #endif
   fflush(stderr);
   }
-  blink_window_record(&win, true);
-  got[i]  = true;
-  received++;
-  }
-  if (blink_fd >= 0) close(blink_fd);
-  if (g_debug_stealth) {
-  uint64_t tot_miss = atomic_load_explicit(&g_blink_missed_windows,
-  memory_order_relaxed);
-  uint64_t tot_hit  = atomic_load_explicit(&g_blink_on_time_windows,
-  memory_order_relaxed);
-  fprintf(stderr,
-  "\n  [blink] session total: %lu on-time  %lu missed"
-  "  (%.1f%% hit)\n",
-  (unsigned long)tot_hit, (unsigned long)tot_miss,
-  (tot_hit + tot_miss) > 0
-  ? 100.0 * (double)tot_hit / (double)(tot_hit + tot_miss)
-  : 100.0);
-  }
   free(got);
+  free(sched);
   } else {
+
   /*
    * Non-blink fallback receive loop — collision-safe rewrite.
    *
@@ -6689,6 +7129,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   {
   mpcp_session_t sess;
   memset(&sess, 0, sizeof(sess));
+  sess.drift_coefficient = 1.0;
   randombytes_buf(sess.session_nonce, MPCP_SESSION_NONCE_LEN);
   randombytes_buf(sess.session_key,   MPCP_SESSION_KEY_LEN);
   /* keystream is O(1) on-the-fly — no allocation needed */
@@ -7398,6 +7839,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint64_t delay_ns = lead_ns;
   if (sess->blink_interval_ns > 0)
   sess->blink_origin_ns = now_ns + lead_ns;
+  sess->t_zero_ns      = sess->blink_origin_ns;
+  sess->drift_coefficient = (sess->drift_coefficient == 0.0) ? 1.0 : sess->drift_coefficient;
   uint64_t delay_be = __builtin_bswap64(delay_ns);
   memcpy(plain + 5, &delay_be, 8);
   uint64_t bi_be = __builtin_bswap64(sess->blink_interval_ns);
@@ -7480,6 +7923,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   uint64_t delay_ns = __builtin_bswap64(delay_be);
   sess->clock_offset_ns   = 0;
   sess->blink_origin_ns   = mpcp_now_ns() + delay_ns;
+  sess->t_zero_ns        = sess->blink_origin_ns;
+  sess->drift_coefficient = 1.0;
   sess->blink_interval_ns = __builtin_bswap64(bi_be);
   fprintf(stderr, "[blink] receiver: interval=%.1fms  origin_in=%.0fms\n",
   (double)sess->blink_interval_ns / 1e6,
@@ -7499,6 +7944,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   *flags_out = plain5[4];
   sess->blink_interval_ns = 0;
   sess->blink_origin_ns   = 0;
+  sess->t_zero_ns        = 0;
+  sess->drift_coefficient = 1.0;
   } else {
   return MPCP_ERR_PROTO;
   }
@@ -7649,7 +8096,42 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   fflush(stderr);
   }
   }
-  fprintf(stderr, "\r  %u pings reflected -- calibration done        \n", reflected);
+  fprintf(stderr, "\r  %u pings reflected -- awaiting sender ready signal...        \n", reflected);
+  {
+  struct timeval tv_ready = { .tv_sec = 12, .tv_usec = 0 };
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_ready, sizeof(tv_ready));
+  bool got_ready = false;
+  while (!got_ready) {
+  ssize_t n = recvfrom(fd, buf, sizeof(buf), 0,
+  (struct sockaddr *)&sender, &slen);
+  if (n <= 0) break;
+  uint8_t pkt_buf[sizeof(mpcp_cal_pkt_t) + 64];
+  size_t  pkt_len = (size_t)n;
+  if (cfg->disguise_calibration) {
+  pkt_len = mpcp_disguise_unwrap(buf, (size_t)n,
+  pkt_buf, sizeof(pkt_buf),
+  cfg->disguise_protocol);
+  if (pkt_len == 0) continue;
+  } else {
+  if ((size_t)n > sizeof(pkt_buf)) continue;
+  memcpy(pkt_buf, buf, (size_t)n);
+  }
+  if (pkt_len < sizeof(mpcp_cal_pkt_t)) continue;
+  mpcp_cal_pkt_t *ready = (mpcp_cal_pkt_t *)pkt_buf;
+  uint32_t magic;
+  memcpy(&magic, &ready->hdr.magic, 4);
+  if (ntohl(magic) != MPCP_MAGIC) continue;
+  if (ready->hdr.version != MPCP_VERSION) continue;
+  if (ready->hdr.type != MPCP_SIG_READY) continue;
+  if (sender_addr_out && sender.sin_addr.s_addr != sender_addr_out->sin_addr.s_addr) continue;
+  if (nonce_hint_out && sodium_memcmp(ready->nonce_hint, nonce_hint_out, MPCP_NONCE_HINT_LEN) != 0) continue;
+  got_ready = true;
+  }
+  if (got_ready)
+  fprintf(stderr, "[Sync] Receiver caught Ready signal, snapping to Handshake.\n");
+  else
+  fprintf(stderr, "[Sync] Ready signal timeout; proceeding to handshake fallback.\n");
+  }
   close(fd);
   return 0;
   }
@@ -8184,43 +8666,50 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   printf("  Ghost chunks   : %s\n", cfg.ghost_chunks_enabled ? "enabled" : "disabled");
   printf("  Port base/range: %u / %u\n", cfg.port_base, cfg.port_range);
   printf("  Pipeline depth : %u\n", cfg.pipeline_depth);
+  printf("  Timing engine  : JIT temporal gatekeeper (blink)\n");
   printf("  %-15s: %s\n", is_sender ? "File" : "Output", file_buf);
   printf("\n");
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
+  fw_maybe_open(cfg.port_base, cfg.port_range);
   mpcp_session_t    sess;
   memset(&sess, 0, sizeof(sess));
+  sess.drift_coefficient = 1.0;
   randombytes_buf(sess.session_nonce, MPCP_SESSION_NONCE_LEN);
   mpcp_candidates_t cands;
   memset(&cands, 0, sizeof(cands));
   int rc = MPCP_OK;
   spinner_t sp;
   if (is_sender) {
-  fw_maybe_open(cfg.port_base, cfg.port_range);
   banner("Calibrating link");
   printf("  Sending pings to receiver at %s:%u …\n",
   inet_ntoa(peer_addr.sin_addr), cfg.port_base);
-  spinner_start(&sp, "  Measuring RTT");
-  double   *rtt_samples = NULL;
-  uint32_t  rtt_count   = 0;
-  mpcp_rtt_result_t rtt;
-  memset(&rtt, 0, sizeof(rtt));
-  rc = mpcp_calibrate_collect_samples(&cfg, &sess, &peer_addr,
-  &rtt_samples, &rtt_count, &rtt);
+  spinner_start(&sp, "  Running 4-phase pre-flight");
+  mpcp_rtt_result_t preflight_rtt;
+  mpcp_calib_t      preflight;
+  memset(&preflight_rtt, 0, sizeof(preflight_rtt));
+  memset(&preflight, 0, sizeof(preflight));
+  rc = mpcp_calibrate(&cfg, &sess, &peer_addr, &preflight_rtt, &preflight);
   spinner_stop(&sp, rc == MPCP_OK);
-  if (rc != MPCP_OK) { mpcp_perror("calibration", rc); return 1; }
-  fprintf(stderr, "\n");
-  printf("  RTT: %.1f ms  std: %.1f ms  catch window: %.0f ms  samples: %u\n",
-  rtt.baseline_mean, rtt.baseline_std, rtt.catch_window, rtt_count);
-  blink_calibrate_from_rtt(&sess, &cfg, rtt_samples, rtt_count,
-  rtt.ewma_rtt);
-  blink_calibrate_from_rtt(&sess, &cfg, rtt_samples, rtt_count,
-  rtt.ewma_rtt);
-  rc = mpcp_derive_master_secret(sess.session_nonce,
-  rtt_samples, rtt_count,
+  if (rc != MPCP_OK) { mpcp_perror("pre-flight", rc); return 1; }
+  sess.blink_interval_ns = preflight.blink_interval_ns;
+  sess.blink_origin_ns   = preflight.tzero_ns;
+  sess.t_zero_ns         = preflight.tzero_ns;
+  sess.drift_coefficient = preflight.drift_coefficient;
+  printf("  Pre-flight lock : %s\n", preflight.handshake_locked ? "LOCKED" : "FAILED");
+  printf("  Stable RTT      : %.3f ms\n", preflight.stable_mean_rtt_ms);
+  printf("  Jitter variance : %.6f ms^2\n", preflight.jitter_variance_ms2);
+  printf("  Drift synthesis : %+0.2f ppm (coef %.9f)\n",
+  preflight.drift_ppm, preflight.drift_coefficient);
+  printf("  Cadence/T0      : %.1f ms, T0 in %.0f ms, port %u\n",
+  (double)preflight.blink_interval_ns / 1e6,
+  (double)(int64_t)(preflight.tzero_ns - mpcp_now_raw_ns()) / 1e6,
+  preflight.ghost_port);
+    rc = mpcp_derive_master_secret(sess.session_nonce,
+  NULL, 0,
   (const uint8_t *)cfg.psk, cfg.psk_len,
   sess.master_secret);
-  free(rtt_samples);
-  if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
+  printf("  Entropy source  : pre-flight complete (no extra ping phase)\n");
+if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   banner("Key exchange");
   spinner_start(&sp, "  Exchanging keys");
   rc = mpcp_exchange_pc2(&cfg, &sess, &peer_addr);
@@ -8276,7 +8765,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   mpcp_perror("send", rc);
   }
   } else {
-  fw_maybe_open(cfg.port_base, cfg.port_range);
   banner("Waiting for sender");
   {
   struct ifaddrs *ifap, *ifa;
@@ -8414,7 +8902,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (outdir[0] == '\0') snprintf(outdir, sizeof(outdir), "%s", getenv("HOME") ? getenv("HOME") : ".");
   printf("  Listening on port %u\n", cfg.port_base);
   printf("  Files will be saved to: %s\n", outdir);
-  fw_maybe_open(cfg.port_base, cfg.port_range);
   {
   struct ifaddrs *ifap, *ifa;
   if (getifaddrs(&ifap) == 0) {
