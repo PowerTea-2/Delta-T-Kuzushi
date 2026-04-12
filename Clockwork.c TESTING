@@ -3046,6 +3046,7 @@ return MPCP_OK;
 
 static int kex_recv_tzero_sync(const mpcp_config_t *cfg,
 mpcp_session_t *sess,
+const struct sockaddr_in *expected_peer,
 uint64_t *tzero_out)
 {
 uint16_t auth_port = kex_port(sess->master_secret, sess->session_nonce,
@@ -3056,9 +3057,11 @@ struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
 int pr = poll(&pfd, 1, 3000);
 if (pr <= 0) { close(fd); return MPCP_ERR_TIMEOUT; }
 mpcp_kex_sync_pkt_t pkt;
-ssize_t n = recvfrom(fd, &pkt, sizeof(pkt), 0, NULL, NULL);
+struct sockaddr_in from; socklen_t fl = sizeof(from);
+ssize_t n = recvfrom(fd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fl);
 close(fd);
 if (n != (ssize_t)sizeof(pkt)) return MPCP_ERR_PROTO;
+if (expected_peer && from.sin_addr.s_addr != expected_peer->sin_addr.s_addr) return MPCP_ERR_PROTO;
 uint32_t magic;
 memcpy(&magic, &pkt.hdr.magic, 4);
 if (ntohl(magic) != MPCP_MAGIC || pkt.hdr.version != MPCP_VERSION || pkt.hdr.type != MPCP_TYPE_ACK)
@@ -3125,14 +3128,26 @@ fprintf(stderr, "[exchange] PC1: sent %u candidates (retransmit)\n", N);
 next_send = mpcp_now_ns() + 100000000ULL;
 }
 bool any_new = false;
+struct pollfd pset[MPCP_MAX_CANDIDATES];
+nfds_t pcount = 0;
+for (uint32_t i = 0; i < N; i++) {
+if (socks[i].fd < 0 || received[i]) continue;
+pset[pcount].fd = socks[i].fd;
+pset[pcount].events = POLLIN;
+pset[pcount].revents = 0;
+pcount++;
+}
+if (pcount == 0 || poll(pset, pcount, 2000) <= 0) {
+struct timespec ts = {0, 1000000L};
+nanosleep(&ts, NULL);
+continue;
+}
 for (uint32_t i = 0; i < N; i++) {
 if (socks[i].fd < 0 || received[i]) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
 struct sockaddr_in from_pc2; socklen_t flen = sizeof(from_pc2);
-struct pollfd pfd = { .fd = socks[i].fd, .events = POLLIN, .revents = 0 };
-if (poll(&pfd, 1, 3000) <= 0) continue;
 ssize_t n = recvfrom(socks[i].fd, buf, sizeof(buf),
-0, (struct sockaddr *)&from_pc2, &flen);
+MSG_DONTWAIT, (struct sockaddr *)&from_pc2, &flen);
 if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
 if (from_pc2.sin_addr.s_addr != pc2_addr->sin_addr.s_addr) continue;
 const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
@@ -3180,7 +3195,7 @@ rc = auth_send_sig(cfg, sess, pc2_addr);
 if (rc != MPCP_OK) goto done_pc1;
 {
 uint64_t synced_tzero = 0;
-int src = kex_recv_tzero_sync(cfg, sess, &synced_tzero);
+int src = kex_recv_tzero_sync(cfg, sess, pc2_addr, &synced_tzero);
 if (src == MPCP_OK) {
 sess->t_zero_ns = synced_tzero;
 sess->blink_origin_ns = synced_tzero;
@@ -3229,14 +3244,26 @@ uint32_t cnt_check = 0;
 for (uint32_t i = 0; i < N; i++) if (got_key[i]) cnt_check++;
 if (cnt_check == N) break;
 bool any_new = false;
+struct pollfd pset[MPCP_MAX_CANDIDATES];
+nfds_t pcount = 0;
+for (uint32_t i = 0; i < N; i++) {
+if (got_key[i] || recv_socks[i].fd < 0) continue;
+pset[pcount].fd = recv_socks[i].fd;
+pset[pcount].events = POLLIN;
+pset[pcount].revents = 0;
+pcount++;
+}
+if (pcount == 0 || poll(pset, pcount, 2000) <= 0) {
+struct timespec ts = {0, 1000000L};
+nanosleep(&ts, NULL);
+continue;
+}
 for (uint32_t i = 0; i < N; i++) {
 if (got_key[i] || recv_socks[i].fd < 0) continue;
 uint8_t buf[sizeof(mpcp_key_pkt_t)];
 struct sockaddr_in from_pc1; socklen_t flen2 = sizeof(from_pc1);
-struct pollfd pfd = { .fd = recv_socks[i].fd, .events = POLLIN, .revents = 0 };
-if (poll(&pfd, 1, 3000) <= 0) continue;
 ssize_t n = recvfrom(recv_socks[i].fd, buf, sizeof(buf),
-0, (struct sockaddr *)&from_pc1, &flen2);
+MSG_DONTWAIT, (struct sockaddr *)&from_pc1, &flen2);
 if (n != (ssize_t)sizeof(mpcp_key_pkt_t)) continue;
 if (from_pc1.sin_addr.s_addr != pc1_addr->sin_addr.s_addr) continue;
 const mpcp_key_pkt_t *pkt = (const mpcp_key_pkt_t *)buf;
@@ -8096,6 +8123,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (ntohl(magic) != MPCP_MAGIC) continue;
   if (ready->hdr.version != MPCP_VERSION) continue;
   if (ready->hdr.type != MPCP_SIG_READY) continue;
+  if (sender_addr_out && sender.sin_addr.s_addr != sender_addr_out->sin_addr.s_addr) continue;
   if (nonce_hint_out && sodium_memcmp(ready->nonce_hint, nonce_hint_out, MPCP_NONCE_HINT_LEN) != 0) continue;
   got_ready = true;
   }
@@ -8642,6 +8670,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   printf("  %-15s: %s\n", is_sender ? "File" : "Output", file_buf);
   printf("\n");
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
+  fw_maybe_open(cfg.port_base, cfg.port_range);
   mpcp_session_t    sess;
   memset(&sess, 0, sizeof(sess));
   sess.drift_coefficient = 1.0;
@@ -8675,24 +8704,12 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   (double)preflight.blink_interval_ns / 1e6,
   (double)(int64_t)(preflight.tzero_ns - mpcp_now_raw_ns()) / 1e6,
   preflight.ghost_port);
-  spinner_start(&sp, "  Collecting RTT entropy samples");
-  double   *rtt_samples = NULL;
-  uint32_t  rtt_count   = 0;
-  mpcp_rtt_result_t rtt;
-  memset(&rtt, 0, sizeof(rtt));
-  rc = mpcp_calibrate_collect_samples(&cfg, &sess, &peer_addr,
-  &rtt_samples, &rtt_count, &rtt);
-  spinner_stop(&sp, rc == MPCP_OK);
-  if (rc != MPCP_OK) { mpcp_perror("calibration", rc); return 1; }
-  fprintf(stderr, "\n");
-  printf("  RTT entropy     : mean %.1f ms  std %.1f ms  catch %.0f ms  n=%u\n",
-  rtt.baseline_mean, rtt.baseline_std, rtt.catch_window, rtt_count);
-  rc = mpcp_derive_master_secret(sess.session_nonce,
-  rtt_samples, rtt_count,
+    rc = mpcp_derive_master_secret(sess.session_nonce,
+  NULL, 0,
   (const uint8_t *)cfg.psk, cfg.psk_len,
   sess.master_secret);
-  free(rtt_samples);
-  if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
+  printf("  Entropy source  : pre-flight complete (no extra ping phase)\n");
+if (rc != MPCP_OK) { mpcp_perror("master secret", rc); return 1; }
   banner("Key exchange");
   spinner_start(&sp, "  Exchanging keys");
   rc = mpcp_exchange_pc2(&cfg, &sess, &peer_addr);
@@ -9022,12 +9039,6 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   return 1;
   }
   contacts_load();
-  {
-  mpcp_config_t _fw_cfg;
-  mpcp_config_defaults(&_fw_cfg);
-  mpcp_config_load_default(&_fw_cfg);
-  fw_maybe_open(_fw_cfg.port_base, _fw_cfg.port_range);
-  }
   ui_colour_init();
   ui_print_logo();
   for (;;) {
