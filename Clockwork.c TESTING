@@ -275,6 +275,8 @@ uint16_t    port_base;
 uint32_t    port_range;  
 uint32_t    port_hop_interval;  
 uint32_t    blink_interval_us;  
+uint32_t    heisenberg_jitter_us;
+bool        strict_sync;
 mpcp_nat_mode_t nat_mode;
 char        rendezvous_host[256];
 uint16_t    rendezvous_port;  
@@ -612,15 +614,20 @@ clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
 }
 static inline void mpcp_precise_wait_ns(uint64_t target_ns, uint64_t busy_wait_ns)
 {
-uint64_t now = mpcp_now_ns();
+struct timespec ts_now;
+clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
+uint64_t now = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
 if (target_ns > now + busy_wait_ns) {
 uint64_t sleep_until = target_ns - busy_wait_ns;
 struct timespec ts;
 ts.tv_sec  = (time_t)(sleep_until / 1000000000ULL);
 ts.tv_nsec = (long)(sleep_until % 1000000000ULL);
-(void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+(void)clock_nanosleep(CLOCK_MONOTONIC_RAW, TIMER_ABSTIME, &ts, NULL);
 }
-while ((now = mpcp_now_ns()) < target_ns) {
+while (1) {
+clock_gettime(CLOCK_MONOTONIC_RAW, &ts_now);
+now = (uint64_t)ts_now.tv_sec * 1000000000ULL + (uint64_t)ts_now.tv_nsec;
+if (now >= target_ns) break;
 __asm__ __volatile__("pause" ::: "memory");
 }
 }
@@ -948,7 +955,7 @@ uint32_t                   n_chunks);
 static uint16_t blink_hop_port(const mpcp_session_t *sess,
 const mpcp_config_t  *cfg,
 uint32_t              chunk_idx);
-static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq);
+static int32_t schedule_jitter_ns(const mpcp_session_t *sess, const mpcp_config_t *cfg, uint32_t seq);
 static uint64_t blink_arrival_time(const mpcp_session_t *sess,
 uint32_t              chunk_idx);
 static ssize_t blink_recv_window(int fd, void *buf, size_t buf_len,
@@ -1357,6 +1364,8 @@ return rc;
   cfg->port_range         = 55000;
   cfg->port_hop_interval  = 1;  
   cfg->blink_interval_us  = 0;  
+  cfg->heisenberg_jitter_us = 50;
+  cfg->strict_sync = false;
   cfg->nat_mode           = MPCP_NAT_AUTO;
   cfg->rendezvous_port    = 7777;
   cfg->rendezvous_timeout = 30;
@@ -4569,7 +4578,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   if (use_blink_pacer) {
   double scaled = (double)seq * (double)_blink_interval_ns * _drift;
   int64_t _abs_target_i = (int64_t)_origin_ns + (int64_t)scaled + (int64_t)_pid_c
-                        + (int64_t)schedule_jitter_ns(ctx->sess, seq);
+                        + (int64_t)schedule_jitter_ns(ctx->sess, ctx->cfg, seq);
   uint64_t _abs_target = (_abs_target_i > 0) ? (uint64_t)_abs_target_i : _origin_ns;
   mpcp_precise_wait_ns(_abs_target, 50000ULL);
   }
@@ -5136,7 +5145,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   ((uint32_t)out[2] <<  8) |  (uint32_t)out[3];
   return (uint16_t)(seed % cfg->port_range + cfg->port_base);
   }
-  static int32_t schedule_jitter_ns(const mpcp_session_t *sess, uint32_t seq)
+  static int32_t schedule_jitter_ns(const mpcp_session_t *sess, const mpcp_config_t *cfg, uint32_t seq)
   {
   uint8_t out[4];
   uint8_t ikm[8];
@@ -5148,8 +5157,12 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   return 0;
   uint32_t v = ((uint32_t)out[0] << 24) | ((uint32_t)out[1] << 16) |
   ((uint32_t)out[2] << 8) | (uint32_t)out[3];
-  int32_t span = 100001; /* [-50000, +50000] ns */
-  return (int32_t)(v % (uint32_t)span) - 50000;
+  int32_t amp_ns = (int32_t)cfg->heisenberg_jitter_us * 1000;
+  if (amp_ns < 0) amp_ns = 0;
+  if (amp_ns > 500000) amp_ns = 500000;
+  int32_t span = amp_ns * 2 + 1;
+  if (span <= 1) return 0;
+  return (int32_t)(v % (uint32_t)span) - amp_ns;
   }
   static void mpcp_generate_schedule(const mpcp_session_t *sess,
   const mpcp_config_t *cfg,
@@ -5165,7 +5178,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   out[i].chunk_index = seq;
   double scaled = (double)i * (double)interval_ns * drift_coefficient;
   int64_t target = (int64_t)tzero_ns + (int64_t)scaled;
-  int32_t jit = schedule_jitter_ns(sess, seq);
+  int32_t jit = schedule_jitter_ns(sess, cfg, seq);
   out[i].jitter_ns = jit;
   out[i].expected_arrival_ns = (target + jit > 0) ? (uint64_t)(target + jit) : tzero_ns;
   uint8_t sub = 0;
@@ -8129,8 +8142,10 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   if (got_ready)
   fprintf(stderr, "[Sync] Receiver caught Ready signal, snapping to Handshake.\n");
-  else
+  else {
   fprintf(stderr, "[Sync] Ready signal timeout; proceeding to handshake fallback.\n");
+  if (cfg->strict_sync) { close(fd); return -1; }
+  }
   }
   close(fd);
   return 0;
@@ -8658,6 +8673,11 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   read_line("  Pipeline depth [default 1]: ", tmp, sizeof(tmp));
   if (tmp[0] != '\0') cfg.pipeline_depth = (uint32_t)atoi(tmp);
   cfg.tripwire = ask_yn("  Enable tripwire?", true);
+  read_line("  Blink interval us [0=auto]: ", tmp, sizeof(tmp));
+  if (tmp[0] != '\0') cfg.blink_interval_us = (uint32_t)atoi(tmp);
+  read_line("  Heisenberg jitter us [default 50]: ", tmp, sizeof(tmp));
+  if (tmp[0] != '\0') cfg.heisenberg_jitter_us = (uint32_t)atoi(tmp);
+  cfg.strict_sync = ask_yn("  Strict sync barrier?", false);
   }
   banner("Summary");
   printf("  Mode           : %s\n", is_sender ? "send (PC2)" : "receive (PC1)");
@@ -8667,6 +8687,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   printf("  Port base/range: %u / %u\n", cfg.port_base, cfg.port_range);
   printf("  Pipeline depth : %u\n", cfg.pipeline_depth);
   printf("  Timing engine  : JIT temporal gatekeeper (blink)\n");
+  printf("  Jitter (us)    : %u\n", cfg.heisenberg_jitter_us);
+  printf("  Strict sync    : %s\n", cfg.strict_sync ? "enabled" : "disabled");
   printf("  %-15s: %s\n", is_sender ? "File" : "Output", file_buf);
   printf("\n");
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
