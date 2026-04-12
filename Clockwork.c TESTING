@@ -320,6 +320,19 @@ double baseline_std;
 uint32_t sample_count;
 } mpcp_rtt_result_t;
 
+typedef struct {
+double   stable_mean_rtt_ms;
+double   jitter_variance_ms2;
+double   drift_ppm;
+double   drift_coefficient;
+uint64_t blink_interval_ns;
+uint64_t tzero_ns;
+uint16_t ghost_port;
+uint32_t samples_sent;
+uint32_t samples_kept;
+bool     handshake_locked;
+} mpcp_calib_t;
+
 /* ---------------------------------------------------------------------------
  * q32_t  —  signed Q16.16 fixed-point scalar (FPU-free Kalman arithmetic)
  *
@@ -666,7 +679,8 @@ void mpcp_config_dump(const mpcp_config_t *cfg, FILE *out);
 int mpcp_calibrate(const mpcp_config_t     *cfg,
 const mpcp_session_t    *sess,
 const struct sockaddr_in *peer_addr,
-mpcp_rtt_result_t       *result_out);
+mpcp_rtt_result_t       *result_out,
+mpcp_calib_t            *calib_out);
 int mpcp_calibrate_collect_samples(const mpcp_config_t     *cfg,
 const mpcp_session_t    *sess,
 const struct sockaddr_in *peer,
@@ -2111,66 +2125,244 @@ core_id, core_id, core_id, core_id);
 }
 return MPCP_OK;
 }
+static inline uint64_t mpcp_now_raw_ns(void)
+{
+struct timespec ts;
+clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static double percentile_sorted(const double *sorted, size_t n, double p)
+{
+if (n == 0) return 0.0;
+if (p <= 0.0) return sorted[0];
+if (p >= 1.0) return sorted[n - 1];
+double idx = p * (double)(n - 1);
+size_t lo = (size_t)idx;
+size_t hi = (lo + 1 < n) ? lo + 1 : lo;
+double frac = idx - (double)lo;
+return sorted[lo] + frac * (sorted[hi] - sorted[lo]);
+}
+
+static void insertion_sort_double(double *a, size_t n)
+{
+for (size_t i = 1; i < n; i++) {
+double key = a[i];
+ssize_t j = (ssize_t)i - 1;
+while (j >= 0 && a[j] > key) {
+a[j + 1] = a[j];
+j--;
+}
+a[j + 1] = key;
+}
+}
+
+static int cal_ping_once_raw(int sock,
+const mpcp_config_t *cfg,
+const struct sockaddr_in *peer,
+const uint8_t session_nonce[MPCP_SESSION_NONCE_LEN],
+uint16_t seq,
+double *rtt_ms_out,
+uint64_t *t_send_raw_out,
+uint64_t *t_recv_raw_out)
+{
+mpcp_cal_pkt_t ping;
+build_ping(&ping, seq, session_nonce);
+uint8_t wire[MPCP_CAL_WIRE_BUF];
+size_t wire_len = sizeof(ping);
+if (cfg->disguise_calibration) {
+wire_len = mpcp_disguise_wrap((const uint8_t *)&ping, sizeof(ping),
+wire, sizeof(wire), cfg->disguise_protocol);
+if (wire_len == 0) return MPCP_ERR_PROTO;
+} else {
+memcpy(wire, &ping, sizeof(ping));
+}
+uint64_t t0 = mpcp_now_raw_ns();
+if (sendto(sock, wire, wire_len, 0, (const struct sockaddr *)peer, sizeof(*peer)) < 0)
+return MPCP_ERR_IO;
+uint8_t rx[MPCP_CAL_WIRE_BUF];
+struct sockaddr_in from;
+socklen_t fromlen = sizeof(from);
+ssize_t n = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+uint64_t t1 = mpcp_now_raw_ns();
+if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? MPCP_ERR_TIMEOUT : MPCP_ERR_IO;
+if (from.sin_addr.s_addr != peer->sin_addr.s_addr) return MPCP_ERR_TIMEOUT;
+size_t payload_len = (size_t)n;
+if (cfg->disguise_calibration) {
+payload_len = mpcp_disguise_unwrap(rx, (size_t)n, rx, sizeof(rx), cfg->disguise_protocol);
+if (payload_len == 0) return MPCP_ERR_PROTO;
+}
+uint64_t echoed_send_ts = 0;
+if (!parse_pong(rx, payload_len, seq, &echoed_send_ts)) return MPCP_ERR_PROTO;
+(void)echoed_send_ts;
+double rtt_ms = (double)(t1 - t0) / 1e6;
+if (rtt_ms <= 0.01 || rtt_ms > 5000.0) return MPCP_ERR_TIMEOUT;
+*rtt_ms_out = rtt_ms;
+if (t_send_raw_out) *t_send_raw_out = t0;
+if (t_recv_raw_out) *t_recv_raw_out = t1;
+return MPCP_OK;
+}
+
+static uint16_t calib_ghost_port(const mpcp_config_t *cfg, const mpcp_session_t *sess)
+{
+if (cfg->port_range == 0) return cfg->port_base;
+uint8_t digest[4];
+crypto_generichash_state st;
+crypto_generichash_init(&st, NULL, 0, sizeof(digest));
+crypto_generichash_update(&st, sess->session_nonce, MPCP_SESSION_NONCE_LEN);
+crypto_generichash_update(&st, (const unsigned char *)"cal-ghost", 9);
+crypto_generichash_final(&st, digest, sizeof(digest));
+uint32_t v = ((uint32_t)digest[0] << 24) | ((uint32_t)digest[1] << 16)
+| ((uint32_t)digest[2] << 8)  | ((uint32_t)digest[3]);
+return (uint16_t)(cfg->port_base + (v % cfg->port_range));
+}
+
 int mpcp_calibrate(const mpcp_config_t    *cfg,
 const mpcp_session_t   *sess,
 const struct sockaddr_in *peer_addr,
-mpcp_rtt_result_t      *result_out)
+mpcp_rtt_result_t      *result_out,
+mpcp_calib_t           *calib_out)
 {
-const uint32_t BURST = 64u;
-double rtts[64];
+if (!cfg || !sess || !peer_addr || !result_out || !calib_out) return MPCP_ERR_PARAM;
+memset(calib_out, 0, sizeof(*calib_out));
 int sock = cal_socket_open();
 if (sock < 0) return MPCP_ERR_IO;
-size_t n_collected = calibrate_standard(sock, peer_addr, BURST, BURST,
-sess->session_nonce, rtts,
-cfg->disguise_calibration, cfg->disguise_protocol);
+struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+(void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+/* Phase 1: 150-ping jitter profiling with IQR outlier reject */
+enum { PHASE1_TARGET = 150, PHASE1_MAX_ATTEMPTS = 300 };
+double raw_rtts[PHASE1_TARGET];
+size_t raw_n = 0;
+for (uint16_t seq = 1; seq <= PHASE1_MAX_ATTEMPTS && raw_n < PHASE1_TARGET; seq++) {
+double rtt_ms = 0.0;
+if (cal_ping_once_raw(sock, cfg, peer_addr, sess->session_nonce, seq, &rtt_ms, NULL, NULL) == MPCP_OK)
+raw_rtts[raw_n++] = rtt_ms;
+}
+if (raw_n < 30) { close(sock); return MPCP_ERR_TIMEOUT; }
+calib_out->samples_sent = (uint32_t)raw_n;
+double sorted[PHASE1_TARGET];
+memcpy(sorted, raw_rtts, raw_n * sizeof(double));
+insertion_sort_double(sorted, raw_n);
+double q1 = percentile_sorted(sorted, raw_n, 0.25);
+double q3 = percentile_sorted(sorted, raw_n, 0.75);
+double iqr = q3 - q1;
+double upper = q3 + 1.5 * iqr;
+double filt[PHASE1_TARGET];
+size_t fn = 0;
+for (size_t i = 0; i < raw_n; i++) {
+if (raw_rtts[i] <= upper) filt[fn++] = raw_rtts[i];
+}
+if (fn < 10) { close(sock); return MPCP_ERR_TIMEOUT; }
+double mean = 0.0;
+for (size_t i = 0; i < fn; i++) mean += filt[i];
+mean /= (double)fn;
+double var = 0.0;
+for (size_t i = 0; i < fn; i++) {
+double d = filt[i] - mean;
+var += d * d;
+}
+var = (fn > 1) ? (var / (double)(fn - 1)) : 0.0;
+calib_out->stable_mean_rtt_ms = mean;
+calib_out->jitter_variance_ms2 = var;
+calib_out->samples_kept = (uint32_t)fn;
+
+/* Phase 2: 2-second drift synthesis via RTT trend slope */
+uint64_t t_start = mpcp_now_raw_ns();
+uint64_t t_end = t_start + 2000000000ULL;
+double x_sum = 0.0, y_sum = 0.0, x2_sum = 0.0, xy_sum = 0.0;
+size_t n = 0;
+uint16_t seq = 1000;
+while (mpcp_now_raw_ns() < t_end) {
+double rtt_ms = 0.0;
+uint64_t ts = 0, tr = 0;
+if (cal_ping_once_raw(sock, cfg, peer_addr, sess->session_nonce, seq++, &rtt_ms, &ts, &tr) == MPCP_OK) {
+double x = (double)(ts - t_start) / 1e9;
+double y = rtt_ms / 2.0;
+x_sum += x; y_sum += y; x2_sum += x * x; xy_sum += x * y;
+n++;
+}
+struct timespec nap = { .tv_sec = 0, .tv_nsec = 2000000L };
+nanosleep(&nap, NULL);
+}
+double slope_ms_per_s = 0.0;
+if (n >= 2) {
+double den = (double)n * x2_sum - x_sum * x_sum;
+if (fabs(den) > 1e-12) slope_ms_per_s = (((double)n * xy_sum) - (x_sum * y_sum)) / den;
+}
+calib_out->drift_ppm = slope_ms_per_s * 1000.0;
+calib_out->drift_coefficient = 1.0 + (calib_out->drift_ppm / 1000000.0);
+
+/* Phase 3: dynamic cadence selection */
+if (cfg->blink_interval_us > 0) {
+calib_out->blink_interval_ns = (uint64_t)cfg->blink_interval_us * 1000ULL;
+} else {
+double jitter_us = sqrt(var) * 1000.0;
+if (jitter_us < 100.0) calib_out->blink_interval_ns = 10000000ULL;
+else if (jitter_us > 5000.0) calib_out->blink_interval_ns = 500000000ULL;
+else if (jitter_us > 1000.0) calib_out->blink_interval_ns = 100000000ULL;
+else calib_out->blink_interval_ns = 25000000ULL;
+}
+
+/* Phase 4: epoch handshake + bounded ghost verification */
+calib_out->ghost_port = calib_ghost_port(cfg, sess);
+struct sockaddr_in ghost_peer = *peer_addr;
+ghost_peer.sin_port = htons(calib_out->ghost_port);
+calib_out->tzero_ns = mpcp_now_raw_ns() + 2000000000ULL;
+uint64_t fire_ns = calib_out->tzero_ns + calib_out->blink_interval_ns;
+while (mpcp_now_raw_ns() < fire_ns) {
+uint64_t rem = fire_ns - mpcp_now_raw_ns();
+struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)((rem > 1000000ULL) ? 1000000ULL : rem) };
+nanosleep(&ts, NULL);
+}
+mpcp_cal_pkt_t ghost;
+build_ping(&ghost, 0xEE01u, sess->session_nonce);
+uint8_t wire[MPCP_CAL_WIRE_BUF];
+size_t wire_len = sizeof(ghost);
+if (cfg->disguise_calibration) {
+wire_len = mpcp_disguise_wrap((const uint8_t *)&ghost, sizeof(ghost), wire,
+sizeof(wire), cfg->disguise_protocol);
+if (wire_len == 0) { close(sock); return MPCP_ERR_PROTO; }
+} else {
+memcpy(wire, &ghost, sizeof(ghost));
+}
+if (sendto(sock, wire, wire_len, 0, (const struct sockaddr *)&ghost_peer, sizeof(ghost_peer)) < 0) {
+close(sock); return MPCP_ERR_IO;
+}
+struct timeval strict = { .tv_sec = 0, .tv_usec = (suseconds_t)((calib_out->blink_interval_ns / 4ULL) / 1000ULL) };
+if (strict.tv_usec < 10000) strict.tv_usec = 10000;
+if (strict.tv_usec > 250000) strict.tv_usec = 250000;
+(void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &strict, sizeof(strict));
+uint8_t rx[MPCP_CAL_WIRE_BUF];
+struct sockaddr_in from;
+socklen_t fromlen = sizeof(from);
+ssize_t rn = recvfrom(sock, rx, sizeof(rx), 0, (struct sockaddr *)&from, &fromlen);
+if (rn > 0) {
+size_t plen = (size_t)rn;
+if (cfg->disguise_calibration)
+plen = mpcp_disguise_unwrap(rx, plen, rx, sizeof(rx), cfg->disguise_protocol);
+uint64_t ts_echo = 0;
+if (plen > 0 && parse_pong(rx, plen, 0xEE01u, &ts_echo)) calib_out->handshake_locked = true;
+}
 close(sock);
-if (n_collected < 3) return MPCP_ERR_TIMEOUT;
-double sorted[64];
-memcpy(sorted, rtts, n_collected * sizeof(double));
-for (size_t _si = 1; _si < n_collected; _si++) {
-double _key = sorted[_si];
-ssize_t _sj = (ssize_t)_si - 1;
-while (_sj >= 0 && sorted[_sj] > _key) { sorted[_sj + 1] = sorted[_sj]; _sj--; }
-sorted[_sj + 1] = _key;
-}
-size_t _trim = (size_t)(n_collected / 10u);
-size_t _lo = _trim;
-size_t _hi = n_collected - _trim;
-if (_hi <= _lo) { _hi = n_collected; _lo = 0; }
-size_t _mid_count = _hi - _lo;
-size_t _mid = _lo + _mid_count / 2u;
-double _median = (_mid_count % 2u == 0u)
-? (sorted[_mid - 1u] + sorted[_mid]) / 2.0
-: sorted[_mid];
-result_out->median_rtt    = _median;
-result_out->trimmed_mean  = _median;
-result_out->ewma_rtt      = _median;
-result_out->sample_count  = (uint32_t)_mid_count;
-double _mad_vals[64] = {0};
-for (size_t _mi = _lo; _mi < _hi; _mi++)
-_mad_vals[_mi - _lo] = fabs(sorted[_mi] - _median);
-for (size_t _si = 1; _si < _mid_count; _si++) {
-double _key = _mad_vals[_si];
-ssize_t _sj = (ssize_t)_si - 1;
-while (_sj >= 0 && _mad_vals[_sj] > _key) { _mad_vals[_sj + 1] = _mad_vals[_sj]; _sj--; }
-_mad_vals[_sj + 1] = _key;
-}
-size_t _mhalf = _mid_count / 2u;
-double _mad = (_mid_count % 2u == 0u)
-? (_mad_vals[_mhalf - 1u] + _mad_vals[_mhalf]) / 2.0
-: _mad_vals[_mhalf];
-result_out->mad           = _mad;
-result_out->robust_std    = 1.4826 * _mad;
-result_out->baseline_mean = _median;
-result_out->baseline_std  = result_out->robust_std;
-result_out->catch_window  = compute_catch_window(
-result_out->ewma_rtt,
+if (!calib_out->handshake_locked) return MPCP_ERR_TIMEOUT;
+
+result_out->trimmed_mean  = calib_out->stable_mean_rtt_ms;
+result_out->median_rtt    = calib_out->stable_mean_rtt_ms;
+result_out->mad           = sqrt(calib_out->jitter_variance_ms2);
+result_out->robust_std    = result_out->mad;
+result_out->ewma_rtt      = calib_out->stable_mean_rtt_ms;
+result_out->baseline_mean = calib_out->stable_mean_rtt_ms;
+result_out->baseline_std  = (result_out->robust_std > 1e-6) ? result_out->robust_std : 1e-6;
+result_out->catch_window  = compute_catch_window(result_out->ewma_rtt,
 result_out->robust_std,
 cfg->stddev_multiplier,
 (double)cfg->floor_buffer,
 (double)cfg->max_catch_window);
+result_out->sample_count  = calib_out->samples_kept;
 return MPCP_OK;
 }
+
 void mpcp_cal_ewma_update(mpcp_rtt_result_t *result,
 double new_rtt_ms,
 double alpha)
