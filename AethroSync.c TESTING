@@ -3,6 +3,7 @@
 // Build:  gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 mpcp.c -o mpcp -lsodium -lzstd -lm -lpthread
 // Logic:  BLOCK-SYNC (256) | O(1)-KEYSTREAM | HW-TIMESTAMP | CONDVAR-RING | GHOST-STEALTH
 // Arch:   On-the-fly ChaCha20 keystream (no malloc) | condvar ring | hw-level RTT | Ed25519 UX
+// NOTE: IF EDITING THIS FILE, MAKE SURE TO ALWAYS CHANGE THIS NUMBER TO ONE DECIMAL HIGHER TO TRACK VERSION: 0.8-test
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -176,7 +177,7 @@ fflush(stdout);
 ui_sleep_ms(55);
 }
 if (g_ui_colour) {
-printf("  %s" GLYPH_LOCK "  %sMulti-Port Catch Protocol%s  %sv0.5%s\n",
+printf("  %s" GLYPH_LOCK "  %sMulti-Port Catch Protocol%s  %sv0.8-PROD%s\n",
 C_PLUM, C_VIOLET, C_RESET, C_GREY, C_RESET);
 } else {
 printf("  Multi-Port Catch Protocol  v0.5\n");
@@ -4915,78 +4916,153 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   }
   free(got);
   } else {
+  /*
+   * Non-blink fallback receive loop — collision-safe rewrite.
+   *
+   * Port collisions (Birthday Paradox): when two chunks in the same block
+   * derive the same port number from the ChaCha20 keystream, the second
+   * open_udp_socket_on_port() call fails (EADDRINUSE) and returns -1.
+   * That collision victim's packets arrive on the winning socket.
+   *
+   * Three invariants this rewrite enforces:
+   *   1. Seq→index mapping: ps2 from the wire is reverse-mapped to the
+   *      correct slot in block_seqs[] before any state is updated.
+   *   2. No in-loop close: fds[i] is NEVER closed inside the receive loop.
+   *      Sockets stay open for the entire block so collision victims can
+   *      be received via the winning socket.
+   *   3. Guard only on fds[i]<0: got2[i] being true does NOT mean we stop
+   *      polling fds[i] — that socket may still owe us packets for other
+   *      chunks that share the same port.
+   */
   int *fds = calloc(n, sizeof(int));
   if (!fds) {
-  free(pkt);
-  atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
-  return NULL;
+      free(pkt);
+      atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
+      return NULL;
   }
+  /*
+   * Open one UDP socket per chunk.  When two chunks share a port the
+   * second bind fails; fds[victim] = -1.  The victim's traffic is caught
+   * by the winner's fd and dispatched via the seq→index map below.
+   */
   for (uint32_t i = 0; i < n; i++) {
-  uint32_t seq = a->block_seqs[i];
-  fds[i] = open_udp_socket_on_port(chunk_port(sess, cfg, seq));
+      uint32_t seq = a->block_seqs[i];
+      fds[i] = open_udp_socket_on_port(chunk_port(sess, cfg, seq));
   }
   uint64_t deadline_ns = mpcp_now_ns()
-  + (uint64_t)cfg->chunk_retry_timeout * 3ULL * 1000000000ULL
-  + 30000000000ULL;
+                       + (uint64_t)cfg->chunk_retry_timeout * 3ULL * 1000000000ULL
+                       + 30000000000ULL;
   bool *got2 = calloc(n, sizeof(bool));
   if (!got2) {
-  for (uint32_t i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
-  free(fds); free(pkt);
-  atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
-  return NULL;
+      for (uint32_t i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
+      free(fds); free(pkt);
+      atomic_store_explicit(&ctx->t1_done, true, memory_order_release);
+      return NULL;
   }
   while (received < n && mpcp_now_ns() < deadline_ns) {
-  if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
-  bool any = false;
-  for (uint32_t i = 0; i < n; i++) {
-  if (got2[i] || fds[i] < 0) continue;
-  uint32_t seq = a->block_seqs[i];
-  struct sockaddr_in fsrc; socklen_t fsl = sizeof(fsrc);
-  ssize_t nb = recvfrom(fds[i], pkt, pkt_max, MSG_DONTWAIT,
-  (struct sockaddr *)&fsrc, &fsl);
-  if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
-  uint32_t m2; memcpy(&m2, pkt, 4);
-  if (ntohl(m2) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
-  if (pkt[5] != MPCP_TYPE_DATA_CHUNK &&
-  pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
-  uint32_t ps2; memcpy(&ps2, pkt + 6, 4); ps2 = ntohl(ps2);
-  bool isg2 = false;
-  for (uint32_t g = 0; g < ctx->ghost_count; g++)
-  if (ctx->ghost_seqs[g] == ps2) { isg2 = true; break; }
-  if (isg2) {
-  got2[i] = true; received++; any = true;
-  close(fds[i]); fds[i] = -1; continue;
+      if (atomic_load_explicit(&ctx->abort_flag, memory_order_relaxed)) break;
+      bool any = false;
+      for (uint32_t i = 0; i < n; i++) {
+          /*
+           * FIX 3: Guard on fds[i]<0 only.  A socket whose "own" chunk
+           * is already received must stay in the poll loop — it may be
+           * the sole socket for a colliding port and still has other
+           * chunks' packets to deliver.
+           */
+          if (fds[i] < 0) continue;
+
+          struct sockaddr_in fsrc;
+          socklen_t fsl = sizeof(fsrc);
+          ssize_t nb = recvfrom(fds[i], pkt, pkt_max, MSG_DONTWAIT,
+                                (struct sockaddr *)&fsrc, &fsl);
+          if (nb < (ssize_t)MPCP_DATA_HDR_OFFSET) continue;
+
+          /* Packet header validation */
+          uint32_t m2; memcpy(&m2, pkt, 4);
+          if (ntohl(m2) != MPCP_MAGIC || pkt[4] != MPCP_VERSION) continue;
+          if (pkt[5] != MPCP_TYPE_DATA_CHUNK &&
+              pkt[5] != MPCP_TYPE_GHOST_CHUNK) continue;
+
+          uint32_t ps2; memcpy(&ps2, pkt + 6, 4); ps2 = ntohl(ps2);
+
+          /*
+           * FIX 1: Reverse-map ps2 → the correct index in block_seqs[].
+           *
+           * We cannot assume ps2 == block_seqs[i].  When a port collision
+           * occurs the victim's packet arrives on socket i even though
+           * ps2 corresponds to a different chunk j.  Scan block_seqs[]
+           * to find the true owner; skip if unknown or already received.
+           */
+          uint32_t mapped_j = n; /* sentinel: not found */
+          for (uint32_t j = 0; j < n; j++) {
+              if (a->block_seqs[j] == ps2 && !got2[j]) {
+                  mapped_j = j;
+                  break;
+              }
+          }
+          if (mapped_j == n) continue; /* seq not in this block or already done */
+
+          /* Ghost packet: credit the MAPPED index, not i */
+          bool isg2 = false;
+          for (uint32_t g = 0; g < ctx->ghost_count; g++)
+              if (ctx->ghost_seqs[g] == ps2) { isg2 = true; break; }
+          if (isg2) {
+              /*
+               * FIX 2: Do NOT close fds[i] here.  Another chunk sharing
+               * this port may still need this socket.
+               */
+              got2[mapped_j] = true; received++; any = true;
+              continue;
+          }
+
+          /* Dedup is keyed on ps2 (wire seq), correct for all collision cases */
+          if (!mpcp_dedup_accept(&ctx->dedup, ps2)) continue;
+
+          /* Publish ciphertext to the decryption ring */
+          mpcp_ring_slot_t *sl2 = mpcp_ring_claim(&ctx->ring0);
+          sl2->seq_index = ps2;
+          sl2->flags     = pkt[11];
+          size_t ct2 = (size_t)(nb - (ssize_t)MPCP_DATA_HDR_OFFSET);
+          if (ct2 > sl2->buf_capacity) ct2 = sl2->buf_capacity;
+          memcpy(sl2->buf, pkt + MPCP_DATA_HDR_OFFSET, ct2);
+          sl2->ct_len   = ct2;
+          sl2->data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12));
+          memcpy(sl2->nonce, pkt + 16, 24);
+          mpcp_ring_publish(&ctx->ring0, sl2);
+
+          /* ACK — sent back on the socket that received this chunk */
+          { mpcp_ack_pkt_t a2; memset(&a2, 0, sizeof(a2));
+            uint32_t am2 = htonl(MPCP_MAGIC); memcpy(&a2.hdr.magic, &am2, 4);
+            a2.hdr.version = MPCP_VERSION; a2.hdr.type = MPCP_TYPE_ACK;
+            uint32_t as2 = htonl(ps2); memcpy(&a2.ack_seq, &as2, 4);
+            uint8_t ah2[4];
+            if (mpcp_ack_hash(sess->session_key, ps2, ah2) == MPCP_OK)
+                memcpy(&a2.ack_hash, ah2, 4);
+            a2.sack_bitmap = 0;
+            randombytes_buf(a2.padding, sizeof(a2.padding));
+            sendto(fds[i], &a2, sizeof(a2), 0,
+                   (const struct sockaddr *)&fsrc, fsl); }
+
+          /* Progress display */
+          { uint32_t dd = 0;
+            for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
+            fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
+            fflush(stderr); }
+
+          /*
+           * FIX 1+2: Mark the MAPPED index (not i).
+           * FIX 2:   Leave fds[i] open — collision victims sharing this
+           *          port still need it.  All cleanup happens below.
+           */
+          got2[mapped_j] = true; received++; any = true;
+      }
+      if (!any) { struct timespec ts2 = {0, 1000000L}; nanosleep(&ts2, NULL); }
   }
-  if (!mpcp_dedup_accept(&ctx->dedup, ps2)) continue;
-  mpcp_ring_slot_t *sl2 = mpcp_ring_claim(&ctx->ring0);
-  sl2->seq_index = ps2; sl2->flags = pkt[11];
-  size_t ct2 = (size_t)(nb - (ssize_t)MPCP_DATA_HDR_OFFSET);
-  if (ct2 > sl2->buf_capacity) ct2 = sl2->buf_capacity;
-  memcpy(sl2->buf, pkt + MPCP_DATA_HDR_OFFSET, ct2);
-  sl2->ct_len   = ct2;
-  sl2->data_len = ntohl(*(const uint32_t *)(const void *)(pkt + 12));
-  memcpy(sl2->nonce, pkt + 16, 24);
-  mpcp_ring_publish(&ctx->ring0, sl2);
-  { mpcp_ack_pkt_t a2; memset(&a2, 0, sizeof(a2));
-  uint32_t am2 = htonl(MPCP_MAGIC); memcpy(&a2.hdr.magic, &am2, 4);
-  a2.hdr.version = MPCP_VERSION; a2.hdr.type = MPCP_TYPE_ACK;
-  uint32_t as2 = htonl(ps2); memcpy(&a2.ack_seq, &as2, 4);
-  uint8_t ah2[4];
-  if (mpcp_ack_hash(sess->session_key, ps2, ah2) == MPCP_OK)
-  memcpy(&a2.ack_hash, ah2, 4);
-  a2.sack_bitmap = 0;
-  randombytes_buf(a2.padding, sizeof(a2.padding));
-  sendto(fds[i], &a2, sizeof(a2), 0,
-  (const struct sockaddr *)&fsrc, fsl); }
-  uint32_t dd = 0;
-  for (uint32_t _d = 0; _d < n; _d++) if (got2[_d]) dd++;
-  fprintf(stderr, "\r  [%u/%u]   ", dd + 1, ctx->plan.n_chunks);
-  fflush(stderr);
-  got2[i] = true; received++; any = true;
-  close(fds[i]); fds[i] = -1;
-  }
-  if (!any) { struct timespec ts2 = {0, 1000000L}; nanosleep(&ts2, NULL); }
-  }
+  /*
+   * Post-loop cleanup: close every open socket exactly once.
+   * Because collision victims have fds[j]=-1 and winners have unique fd
+   * values, this loop never double-closes.
+   */
   free(got2);
   for (uint32_t i = 0; i < n; i++) if (fds[i] >= 0) close(fds[i]);
   free(fds);
