@@ -8384,6 +8384,7 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   printf("  Ghost chunks   : %s\n", cfg.ghost_chunks_enabled ? "enabled" : "disabled");
   printf("  Port base/range: %u / %u\n", cfg.port_base, cfg.port_range);
   printf("  Pipeline depth : %u\n", cfg.pipeline_depth);
+  printf("  Timing engine  : JIT temporal gatekeeper (blink)\n");
   printf("  %-15s: %s\n", is_sender ? "File" : "Output", file_buf);
   printf("\n");
   if (!ask_yn("Proceed?", true)) { printf("Aborted.\n"); return 0; }
@@ -8399,7 +8400,27 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   banner("Calibrating link");
   printf("  Sending pings to receiver at %s:%u …\n",
   inet_ntoa(peer_addr.sin_addr), cfg.port_base);
-  spinner_start(&sp, "  Measuring RTT");
+  spinner_start(&sp, "  Running 4-phase pre-flight");
+  mpcp_rtt_result_t preflight_rtt;
+  mpcp_calib_t      preflight;
+  memset(&preflight_rtt, 0, sizeof(preflight_rtt));
+  memset(&preflight, 0, sizeof(preflight));
+  rc = mpcp_calibrate(&cfg, &sess, &peer_addr, &preflight_rtt, &preflight);
+  spinner_stop(&sp, rc == MPCP_OK);
+  if (rc != MPCP_OK) { mpcp_perror("pre-flight", rc); return 1; }
+  sess.blink_interval_ns = preflight.blink_interval_ns;
+  sess.blink_origin_ns   = preflight.tzero_ns;
+  sess.t_zero_ns         = preflight.tzero_ns;
+  printf("  Pre-flight lock : %s\n", preflight.handshake_locked ? "LOCKED" : "FAILED");
+  printf("  Stable RTT      : %.3f ms\n", preflight.stable_mean_rtt_ms);
+  printf("  Jitter variance : %.6f ms^2\n", preflight.jitter_variance_ms2);
+  printf("  Drift synthesis : %+0.2f ppm (coef %.9f)\n",
+  preflight.drift_ppm, preflight.drift_coefficient);
+  printf("  Cadence/T0      : %.1f ms, T0 in %.0f ms, port %u\n",
+  (double)preflight.blink_interval_ns / 1e6,
+  (double)(int64_t)(preflight.tzero_ns - mpcp_now_raw_ns()) / 1e6,
+  preflight.ghost_port);
+  spinner_start(&sp, "  Collecting RTT entropy samples");
   double   *rtt_samples = NULL;
   uint32_t  rtt_count   = 0;
   mpcp_rtt_result_t rtt;
@@ -8409,12 +8430,8 @@ static void mpcp_sw_advance_send_base(mpcp_sliding_window_t *sw,
   spinner_stop(&sp, rc == MPCP_OK);
   if (rc != MPCP_OK) { mpcp_perror("calibration", rc); return 1; }
   fprintf(stderr, "\n");
-  printf("  RTT: %.1f ms  std: %.1f ms  catch window: %.0f ms  samples: %u\n",
+  printf("  RTT entropy     : mean %.1f ms  std %.1f ms  catch %.0f ms  n=%u\n",
   rtt.baseline_mean, rtt.baseline_std, rtt.catch_window, rtt_count);
-  blink_calibrate_from_rtt(&sess, &cfg, rtt_samples, rtt_count,
-  rtt.ewma_rtt);
-  blink_calibrate_from_rtt(&sess, &cfg, rtt_samples, rtt_count,
-  rtt.ewma_rtt);
   rc = mpcp_derive_master_secret(sess.session_nonce,
   rtt_samples, rtt_count,
   (const uint8_t *)cfg.psk, cfg.psk_len,
