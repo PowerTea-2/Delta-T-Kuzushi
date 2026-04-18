@@ -1,143 +1,77 @@
-<div align="center">
+# Delta-T
 
-# ⚙ ClockWork ⚙
-### ⋆⁺₊⋆ Gearbound synchronization for MPCP ⋆⁺₊⋆
+**Delta-T** is a performance-focused, minimal, secure file transfer and relay engine, forked from ClockWork. Designed for reliability, atomic precision, and modern cryptography.
 
-<sub><em>crafted in starlight, wound by precision, and built to keep time</em></sub>
+---
 
-<br>
+## Features
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-5a6cff.svg?style=for-the-badge)](https://www.gnu.org/licenses/agpl-3.0)
+- **Zero-heap, ChaCha20/Ed25519 encryption**
+- **Zstandard compression, decoy (ghost) chunk support**
+- **Selective-repeat sliding window for loss tolerance**
+- **Atomic, lock-free synchronization**
+- **Tripwire anomaly detection and stealth mode**
+- **No unnecessary dependencies – pure C, POSIX**
 
-<br>
+---
 
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ P R O J E C T I D E N T I T Y ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
+## Quick Build Guide
 
-**Protocol** · MPCP  
-**Project** · ClockWork  
-**Maintainer** · PowerTea-2
+**Requirements:**  
+- GCC (>= 9)
+- `libsodium-dev` (for Ed25519/ChaCha20)
+- `libzstd-dev` (for Zstandard compression)
+- POSIX threads (`-lpthread`)
 
-⚙═════════════════════◈═════════════════════⚙
+### 🟢 Ubuntu / Debian
 
-</div>
+```sh
+sudo apt update
+sudo apt install build-essential libsodium-dev libzstd-dev
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 Delta-T-Working-0.5 -o delta-t -lsodium -lzstd -lm -lpthread
+```
 
-## ✨ Overview
+### 🟦 Fedora
 
-ClockWork is the tooling and reference implementation built around **MPCP** — the **Multi-Port Catch Protocol**.
+```sh
+sudo dnf install gcc libsodium-devel libzstd-devel make
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 Delta-T-Working-0.5 -o delta-t -lsodium -lzstd -lm -lpthread
+```
 
-It is engineered for:
+### 🐧 Arch Linux
 
-- **Z-score timing windows** and real-time event correlation
-- **XChaCha20-Poly1305 + HKDF** key derivation from shared nonce + PSK
-- **Dynamic port-hopping** with ghost chunks for traffic blending
-- **Tripwire detection** using z-score and χ² loss-pattern analysis
-- **Zero-copy pipeline** with `SCHED_FIFO` timing thread
+```sh
+sudo pacman -S base-devel libsodium zstd
+gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 Delta-T-Working-0.5 -o delta-t -lsodium -lzstd -lm -lpthread
+```
 
-> *A system wound tight enough to hold a signal, and quiet enough to keep it hidden.*
+### Manual Build (Any Distro)
 
-<br>
+1. Ensure you have GCC and libraries above.
+2. Compile:
 
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ M P C P & C l o c k W o r k ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
+   ```sh
+   gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O3 Delta-T-Working-0.5 -o delta-t -lsodium -lzstd -lm -lpthread
+   ```
 
-**MPCP** is the protocol.  
-**ClockWork** is the software built around it.
+---
 
-- MPCP defines the timing, transport, and cryptographic structure
-- ClockWork provides the implementation and user-facing tooling
+## What is Delta-T?
 
-This keeps the protocol specification separate from the application that uses it.
+Delta-T is a minimal, atomic, and high-security transfer engine. It splits files into cryptographically secure chunks, compresses, and relays them with hardware-level precision for ultra-low latency and high reliability.
 
-<br>
+- **No dynamic memory usage for keystreams**
+- **Timings: hardware nanosecond precision**
+- **NAT-resilient, stealth-optional**
 
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ I N S T A L L A T I O N ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
+---
 
-<details>
-<summary><b>✨ Nix (fully reproducible)</b></summary>
+## Why "Delta-T"?
 
-    nix-shell -p libsodium libzstd gcc gnumake --run "bash"
+Reflects precise, minimal, and measurable data transmission intervals (Δt).
 
-</details>
+---
 
-<details>
-<summary><b>🐧 Debian / Ubuntu</b></summary>
+## License
 
-    sudo apt install libsodium-dev libzstd-dev
-
-</details>
-
-<details>
-<summary><b>🎩 Fedora / RHEL</b></summary>
-
-    sudo dnf install libsodium-devel libzstd-dev
-
-</details>
-
-<details>
-<summary><b>🏹 Arch Linux</b></summary>
-
-    sudo pacman -S libsodium zstd
-
-</details>
-
-<details>
-<summary><b>🍎 macOS</b></summary>
-
-    brew install libsodium zstd
-
-</details>
-
-<br>
-
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ B U I L D ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
-
-    gcc -std=c11 -D_GNU_SOURCE -Wall -Wextra -O2 \
-        clockwork.c -o clockwork -lsodium -lzstd -lm -lpthread
-
-If your source filename is different, adjust the first line accordingly.
-
-<br>
-
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ L E G A L ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
-
-Licensed under the **GNU Affero General Public License v3.0**.
-
-**Moral Rights** asserted by PowerTea-2 under EU copyright law.
-
-Any derivative must:
-
-- clearly mark itself as a fork
-- preserve the **Founding Architect** credit in all UI elements
-- label deviations from the MPCP spec as **Unverified Implementation**
-
-See `NOTICE` and `LICENSE` for full terms.
-
-<br>
-
-⚙═════════════════════◈═════════════════════⚙  
-⋆⋆⋆ D O C U M E N T A T I O N ⋆⋆⋆  
-⚙═════════════════════◈═════════════════════⚙
-
-- **Full Protocol Spec** — `MPCP_v0.5_FINAL_PowerTea-2.pdf`
-- **Legal Notice** — `NOTICE`
-- **Security Note** — research + educational use only
-- **Warranty** — none
-
-<br>
-
-<div align="center">
-
-⚙═════════════════════◈═════════════════════⚙  
-⋆⁺₊⋆ c a r v e d i n s t a r l i g h t ⋆⁺₊⋆  
-⚙═════════════════════◈═════════════════════⚙
-
-</div>
+[Your License Here]
